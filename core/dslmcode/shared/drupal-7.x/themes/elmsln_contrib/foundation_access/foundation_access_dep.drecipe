@@ -1,0 +1,35 @@
+{
+    "name": "Foundation access Dependencies",
+    "drush_recipes_api": "1.0",
+    "weight": "0",
+    "core": "7",
+    "recipe": [
+        {
+            "madlib": "TRUE",
+            "command": "vset",
+            "arguments": [
+                "theme_default",
+                "[fa_sub]"
+            ],
+            "tokens": {
+                "[fa_sub]": "Foundation access sub theme to set as default"
+            },
+            "defaults": {
+                "[fa_sub]": "foundation_access"
+            }
+        },
+        {
+            "command": "cc",
+            "arguments": [
+                "all"
+            ]
+        }
+    ],
+    "metadata": {
+        "type": "add-on",
+        "version": "1.0",
+        "author": "heymp",
+        "description": "Module dependencies for using this zurb sub-theme",
+        "lazy": "fad"
+    }
+}

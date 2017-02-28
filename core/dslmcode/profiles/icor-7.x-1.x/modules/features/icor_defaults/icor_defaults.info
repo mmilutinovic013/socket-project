@@ -1,0 +1,13 @@
+name = ICOR defaults
+description = Some settings that help develop meaningful defaults
+core = 7.x
+package = ICOR
+dependencies[] = ctools
+dependencies[] = entity
+dependencies[] = entityreference_view_widget
+dependencies[] = eva
+dependencies[] = features
+dependencies[] = views
+features[ctools][] = views:views_default:3.0
+features[features_api][] = api:2
+features[views_view][] = icor_object_lists

@@ -1,0 +1,131 @@
+<?php
+/**
+ * @file
+ * Code for the Editorial Story Seeds feature.
+ */
+
+include_once 'editorial_story_seeds.features.inc';
+
+/**
+ * Implements hook_block_info().
+ */
+function editorial_story_seeds_block_info() {
+  $blocks['editorial_story_seeds_block'] = array(
+    'info' => t("User's story seeds"),
+    'cache' => DRUPAL_NO_CACHE
+  );
+
+  return $blocks;
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() for BASE_FORM_ID().
+ */
+function editorial_story_seeds_form_editorial_story_seeds_node_form_alter(&$form, &$form_state) {
+  // fix weird issue where add-more seeds button will throw validation error in ajax calls
+  // this only happens when this form is actually loaded onto the display of
+  // a journal entry.
+  $node = menu_get_object();
+  if (isset($node->type) && $node->type == 'editorial_journal_entry') {
+    drupal_add_css(drupal_get_path('module', 'editorial_story_seeds') . '/css/editorial_story_seeds.css');
+    unset($form['field_seed']['und']['add_more']['#ajax']);
+  }
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function editorial_story_seeds_block_view($delta = '') {
+  $block = array();
+  switch ($delta) {
+    case 'editorial_story_seeds_block':
+      $type = 'editorial_story_seeds';
+      if (node_access('create', $type)) {
+        $block['subject'] = t('Your seeds');
+        module_load_include('inc', 'node', 'node.pages');
+        $query = new EntityFieldQuery;
+        $query->entityCondition('entity_type', 'node')
+              ->entityCondition('bundle', 'editorial_story_seeds')
+              ->propertyCondition('uid', $GLOBALS['user']->uid , '=');
+        $result = $query->execute();
+        // if we have any results then force them over to this node
+        // this ensures they only have 1 connonical source of story seeds
+        if (isset($result['node'])) {
+          module_load_include('inc', 'node', 'node.pages');
+          $tmp = array_pop($result['node']);
+          $node = node_load($tmp->nid);
+          $form_state['build_info']['args'] = array($node);
+          form_load_include($form_state, 'inc', 'node', 'node.pages');
+          $block['content']['form'] = drupal_get_form($type . '_node_form', $node);
+        }
+        else {
+          $node = (object) array('uid' => $GLOBALS['user']->uid, 'name' => (isset($GLOBALS['user']->name) ? $GLOBALS['user']->name : ''), 'type' => $type, 'language' => LANGUAGE_NONE);
+          $form_state['build_info']['args'] = array($node);
+          form_load_include($form_state, 'inc', 'node', 'node.pages');
+          $block['content']['form'] = drupal_build_form($type . '_node_form', $form_state);
+        }
+      }
+    break;
+  }
+  return $block;
+}
+
+/**
+ * Implements hook_node_prepare().
+ */
+function editorial_story_seeds_node_prepare($node) {
+  if (arg(1) == 'add' && $node->type == 'editorial_story_seeds') {
+    $query = new EntityFieldQuery;
+    $query->entityCondition('entity_type', 'node')
+          ->entityCondition('bundle', 'editorial_story_seeds')
+          ->propertyCondition('uid', $GLOBALS['user']->uid , '=');
+    $result = $query->execute();
+    // if we have any results then force them over to this node
+    // this ensures they only have 1 connonical source of story seeds
+    if (isset($result['node'])) {
+      $tmp = array_pop($result['node']);
+      // ensure that staff / admins can still get here when needed
+      if (_cis_connector_role_groupings(array('admin')) && !isset($_GET['entity_iframe'])) {
+        drupal_set_message(t('This page is for submitting story seeds, students will automatically be redirected if they already have story seeds created. !link to access where you would be taken if you were a student.', array('!link' => l(t('Click here'), 'node/' . $tmp->nid . '/edit'))));
+      }
+      else {
+        drupal_goto('node/' . $tmp->nid . '/edit');
+      }
+    }
+  }
+  else {
+    // only hide node title via css additions if we are allowed
+    if (!empty($node->title)) {
+      drupal_add_css(drupal_get_path('module', 'editorial_story_seeds') . '/css/editorial_story_seeds.css');
+    }
+  }
+}
+
+/**
+ * Implements hook_user_insert().
+ */
+function editorial_story_seeds_user_insert(&$edit, $account, $category) {
+  $query = new EntityFieldQuery;
+  $query->entityCondition('entity_type', 'node')
+        ->entityCondition('bundle', 'editorial_story_seeds')
+        ->propertyCondition('uid', $account->uid , '=');
+  $result = $query->execute();
+  // verify that user doesn't have story seeds associated with them
+  // this shouldn't be possible but best to check
+  if (!isset($result['node'])) {
+    // on user insert we need to generate an associated story seeds type
+    $node = new stdClass();
+    $node->type = 'editorial_story_seeds';
+    node_object_prepare($node);
+    $node->language = LANGUAGE_NONE;
+    $node->uid = $account->uid;
+    $node->status = 1;
+    $node->promote = 0;
+    $node->revision = 1;
+    $node->title = t('@name story seeds', array('@name' => $account->name));
+    // build out via submit then save
+    if($node = node_submit($node)) {
+      node_save($node);
+    }
+  }
+}

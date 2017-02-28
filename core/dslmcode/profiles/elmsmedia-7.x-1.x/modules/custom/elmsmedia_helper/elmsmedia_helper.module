@@ -1,0 +1,411 @@
+<?php
+/**
+ * @file
+ * Media integration improvements for ELMS Media distro.
+ */
+
+/**
+ * Implements hook_field_formatter_info_alter().
+ */
+function elmsmedia_helper_field_formatter_info_alter(&$info) {
+  $info['ableplayer_video']['module'] = 'elmsmedia_helper';
+  $info['ableplayer_audio']['module'] = 'elmsmedia_helper';
+  $info['video_embed_field']['module'] = 'elmsmedia_helper';
+}
+
+/**
+ * Implements hook_page_build().
+ */
+function elmsmedia_helper_page_build(&$page) {
+  drupal_add_css(drupal_get_path('module', 'elmsmedia_helper') . '/elmsmedia_helper.css');
+}
+
+/**
+ * Implements hook_field_formatter_view().
+ */
+function elmsmedia_helper_field_formatter_view($entity_type, $entity, $field, $instance, $langcode, $items, $display) {
+  // A unique caller per page for the JS specific settings to use. This may be
+  // different for ever page view and should not be used for styling.
+  static $id = 0;
+  $element = array();
+  $path = drupal_get_path('module', 'ableplayer');
+  foreach ($items as $delta => $item) {
+    // Support the link field type which stores it's data in 'url'.
+    $class = 'ableplayer-formatter-identifier-' . time() . '-' . $id++;
+    $settings = $display['settings'];
+    if (!isset($item['video_url'])) {
+      $src = ($field['type'] == 'link_field') ? $item['url'] : $item['uri'];
+      $js_settings = array(
+        'opts' => array('videoHeight' => (int)$settings['height']),
+      );
+      $element[$delta] = array(
+        '#attributes' => array(
+          'src' => file_create_url($src),
+          'type' => file_get_mimetype($src),
+          'class' => $class,
+          'id' => hash('md5', $src . $id),
+        ),
+        '#settings' => $settings,
+        '#attached' => array(
+          'libraries_load' => array(array('ableplayer')),
+          'js' => array(
+            array('type' => 'setting', 'data' => array('ableplayer' => array('.' . $class => $js_settings))),
+          ),
+        ),
+      );
+    }
+    else {
+      // load up all data pulled in
+      $video_data = unserialize($item['video_data']);
+      $tmp = drupal_parse_url($item['video_url']);
+      if ($video_data['handler'] == 'vimeo') {
+        $element[$delta] = array(
+          '#attributes' => array(
+            'data-vimeo-id' => $video_data['id'],
+            'class' => 'vimeo-video elmsln-video elmsln-video-vimeo',
+            'id' => hash('md5', $video_data['id'] . $id),
+            'frameborder' => "0",
+            'webkitallowfullscreen' => TRUE,
+            'mozallowfullscreen' => TRUE,
+            'allowfullscreen' => TRUE,
+            'src' => 'https://player.vimeo.com/video/' . $video_data['id'] . '?title=0&byline=0&portrait=0',
+            'width' => '640px',
+            'height' => '360px',
+          ),
+          '#settings' => $video_data,
+        );
+      }
+      elseif ($video_data['handler'] == 'youtube') {
+        $yvid = '';
+        // check for youtube url vs embed
+        if (isset($tmp['query']['v'])) {
+          $yvid = $tmp['query']['v'];
+        }
+        else {
+          // rip out from embed based url
+          $ypath = explode('/', $tmp['path']);
+          $next = FALSE;
+          foreach ($ypath as $part) {
+            if ($next) {
+              $yvid = $part;
+              continue;
+            }
+            if ($part == 'embed') {
+              $next = TRUE;
+            }
+          }
+        }
+        $element[$delta] = array(
+          '#attributes' => array(
+            'data-youtube-id' => $yvid,
+            'class' => $class,
+            'id' => hash('md5', $yvid . $id),
+          ),
+          '#settings' => $settings,
+          '#attached' => array(
+            'libraries_load' => array(array('ableplayer')),
+          ),
+        );
+      }
+    }
+
+    if ($display['type'] == 'ableplayer_video') {
+      $element[$delta]['#theme'] = 'elmsmedia_helper_video';
+      $element[$delta]['#attributes']['height'] = $display['settings']['height'];
+      // this is where we deviate from default ableplayer handler
+      // this adds the poster image we want that's been uploaded
+      if (isset($entity->field_poster['und'])) {
+        $element[$delta]['#attributes']['poster'] = file_create_url($entity->field_poster['und'][0]['uri']);
+      }
+      // helps to set the caption file correctly
+      if (isset($entity->field_caption['und'])) {
+        $element[$delta]['#settings']['caption'] = file_create_url($entity->field_caption['und'][0]['uri']);
+      }
+    }
+    elseif ($display['type'] == 'ableplayer_audio') {
+      $element[$delta]['#theme'] = 'elmsmedia_helper_audio';
+      $element[$delta]['#attributes']['height'] = $display['settings']['height'];
+    }
+    elseif ($display['type'] == 'video_embed_field') {
+      // see if this is youtube or vimeo
+      if ($video_data['handler'] == 'vimeo') {
+        $element[$delta]['#theme'] = 'elmsmedia_helper_vimeo';
+      }
+      elseif ($video_data['handler'] == 'youtube') {
+        $element[$delta]['#theme'] = 'elmsmedia_helper_youtube';
+      }
+      // set poster image
+      if (isset($entity->field_poster['und'])) {
+        $element[$delta]['#attributes']['poster'] = file_create_url($entity->field_poster['und'][0]['uri']);
+      }
+    }
+  }
+  return $element;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function elmsmedia_helper_theme() {
+  return array(
+    'elmsmedia_helper_video' => array(
+      'variables' => array('attributes' => array(), 'settings' => array()),
+    ),
+    'elmsmedia_helper_audio' => array(
+      'variables' => array('attributes' => array(), 'settings' => array()),
+    ),
+    'elmsmedia_helper_youtube' => array(
+      'variables' => array('attributes' => array(), 'settings' => array()),
+    ),
+    'elmsmedia_helper_vimeo' => array(
+      'variables' => array('attributes' => array(), 'settings' => array()),
+    ),
+  );
+}
+
+/**
+ * Callback for elmsmedia_helper_video()
+ */
+function theme_elmsmedia_helper_video($variables) {
+  global $base_url;
+  $src = $variables['attributes']['src'];
+  unset($variables['attributes']['src']);
+  $class = '';
+  // make a responsive two-column situation if this has a transcript with it
+  if (isset($variables['settings']['caption'])) {
+    $class = ' class="col s12 m8 l8"';
+  }
+  $output = ' <div class="row ableplayer-video">
+  <div' . $class . '>
+    <video preload="auto" ' . drupal_attributes($variables['attributes']) . ' data-able-player tabindex="-1" data-transcript-div="' . $variables['attributes']['id'] . '-transcript">
+      <source src="' . str_replace($base_url, '', $src) . '"/>';
+  if (isset($variables['settings']['caption'])) {
+    // @todo i9n
+    $output .= '<track kind="captions" src="' . str_replace($base_url, '', $variables['settings']['caption']) . '" srclang="en" />';
+  }
+  $output .= '
+    </video>
+  </div>';
+  if (isset($variables['settings']['caption'])) {
+    $output .= '<div id="' . $variables['attributes']['id'] . '-transcript" class="ableplayer-transcript-container col s12 m4 l4"></div>
+    </div>';
+  }
+  return $output;
+}
+
+/**
+ * Callback for audio rendering.
+ */
+function theme_elmsmedia_helper_audio($variables) {
+  global $base_url;
+  $src = $variables['attributes']['src'];
+  unset($variables['attributes']['src']);
+  $type = $variables['attributes']['type'];
+  unset($variables['attributes']['type']);
+  $class = '';
+  // make a responsive two-column situation if this has a transcript with it
+  if (isset($variables['settings']['caption'])) {
+    $class = 'class="col s12 m8 l8"';
+  }
+  $output = '<div class="row ableplayer-audio">
+  <div' . $class . '>';
+  $output .= '<audio preload="auto" ' . drupal_attributes($variables['attributes']) . ' data-able-player tabindex="-1" data-transcript-div="' . $variables['attributes']['id'] . '-transcript">
+    <source type="' . $type . '" src="' . str_replace($base_url, '', $src) . '"/>';
+  if (isset($variables['settings']['caption'])) {
+    $output .= '<track kind="captions" src="' . str_replace($base_url, '', $variables['settings']['caption']) . '" srclang="en" />';
+  }
+  $output .= '
+    </audio>
+  </div>';
+  if (isset($variables['settings']['caption'])) {
+    $output .= '<div id="' . $variables['attributes']['id'] . '-transcript" class="ableplayer-transcript-container col s12 m4 l4"></div>
+    </div>';
+  }
+  return $output;
+}
+
+/**
+ * Callback for elmsmedia_helper_youtube()
+ */
+function theme_elmsmedia_helper_youtube($variables) {
+  $class = '';
+  if (isset($variables['settings']['caption'])) {
+    $class = 'class="col s12 m8 l8"';
+  }
+  $output = ' <div class="ableplayer-video elmsln-youtube">
+  <div ' . $class . '>
+    <video preload="auto" ' . drupal_attributes($variables['attributes']) . ' data-able-player tabindex="-1">';
+  $output .= '
+    </video>
+  </div>';
+  if (isset($variables['settings']['caption'])) {
+    $output .= '<div id="' . $variables['attributes']['id'] . '-transcript" class="ableplayer-transcript-container col s12 m4 l4"></div>';
+  }
+  $output .= '</div>';
+  return $output;
+}
+
+/**
+ * Callback for elmsmedia_helper_vimeo()
+ */
+function theme_elmsmedia_helper_vimeo($variables) {
+  $class = '';
+  if (isset($variables['settings']['caption'])) {
+    $class = 'class="col s12 m8 l8"';
+  }
+  $output = ' <div class="row vimeo-video elmsln-vimeo">
+    <div ' . $class . '>
+      <iframe ' . drupal_attributes($variables['attributes']) . '></iframe>
+    </div>
+  </div>';
+  return $output;
+}
+
+/**
+ * Implements hook_field_formatter_settings_form().
+ */
+function elmsmedia_helper_field_formatter_settings_form($field, $instance, $view_mode, $form, &$form_state) {
+  $display = $instance['display'][$view_mode];
+  $settings = $display['settings'];
+  $element = array();
+
+  $element['height'] = array(
+    '#title' => t('Height'),
+    '#type' => 'textfield',
+    '#default_value' => $settings['height'],
+  );
+
+  return $element;
+}
+
+/**
+ * Implements hook_field_formatter_settings_summary().
+ */
+function elmsmedia_helper_field_formatter_settings_summary($field, $instance, $view_mode) {
+  $display = $instance['display'][$view_mode];
+  $settings = $display['settings'];
+  return t('Height: @height', array('@height' => (isset($settings['height']) ? $settings['height'] : '')));
+}
+
+/**
+ * Alter the outgoing response.
+ *
+ * Based on cis_helper_restws_response_alter
+ * though this has improvements beyond that cis specific one.
+ *
+ * related support issue https://drupal.org/node/2024603
+ *
+ * @param mixed $response
+ *   The response data being returned by the REST service (not yet serialized).
+ * @param string $function
+ *   The function being called on the REST service.
+ * @param string $format
+ *   The name of the format serializing the response.
+ * @see cis_helper_restws_response_alter()
+ */
+function elmsmedia_helper_restws_response_alter(&$response, $function, $format_name) {
+  // specific modifications based common request type
+  if (($function == 'viewResource' || $function == 'queryResource') && $format_name == 'json' && isset($_GET['deep-load-refs'])) {
+    // query response is nested, direct access is not
+    if ($function == 'queryResource') {
+      foreach ($response['list'] as &$object) {
+        _elmsmedia_helper_restws_deep_load($object);
+      }
+    }
+    else {
+      _elmsmedia_helper_restws_deep_load($response);
+    }
+  }
+}
+
+/**
+ * Callback to perform deep load on a base entity
+ */
+function _elmsmedia_helper_restws_deep_load(&$response) {
+  // build list of allowed entity types to deep pull down
+  $allowed = explode(',', $_GET['deep-load-refs']);
+  // allow for deep loading of resources
+  foreach ($response as $key => &$val) {
+    // check for a single resource verses many
+    if (is_array($val) && isset($val[0]['id'])) {
+      // loop through items loading them in
+      foreach ($val as &$item) {
+        if (in_array($item['resource'], $allowed)) {
+          // load the entity
+          $entity = entity_load_single($item['resource'], $item['id']);
+          // ensure they can view this specific item
+          if (entity_access('view', $item['resource'], $entity)) {
+            // create a meta wrapper to act on for entity
+            $wrapper = entity_metadata_wrapper($item['resource'], $entity);
+            // filter out these values
+            $wrap = restws_property_access_filter($wrapper);
+            $eary = (array) $entity;
+            foreach ($eary as $property => $value) {
+              // value needs to be removed as it didn't pass wrapper validation
+              if (!isset($wrap[$property])) {
+                unset($eary[$property]);
+              }
+            }
+            // add values based on wrapper passing correctly
+            $item = $eary;
+          }
+        }
+      }
+    }
+    elseif (is_array($val) && (isset($val['id']) || isset($val['file']))) {
+      // edge case for file entity type since it nests; weak
+      $is_file = FALSE;
+      if (isset($val['file']) && is_array($val['file'])) {
+        $val = $val['file'];
+        $is_file = TRUE;
+      }
+      if (isset($val['resource']) && in_array($val['resource'], $allowed)) {
+        // load the entity
+        $entity = entity_load_single($val['resource'], $val['id']);
+        // ensure they can view this specific item
+        if (entity_access('view', $val['resource'], $entity)) {
+          // create a meta wrapper to act on for entity
+          $wrapper = entity_metadata_wrapper($val['resource'], $entity);
+          // filter out fields
+          $wrap = restws_property_access_filter($wrapper);
+          // typecast entity as array for property evaluation
+          $eary = (array) $entity;
+          // files don't have a view mode for property filtering
+          if (!$is_file) {
+            foreach ($eary as $property => $value) {
+              // value needs to be removed as it didn't pass wrapper validation
+              if (!isset($wrap[$property])) {
+                unset($eary[$property]);
+              }
+            }
+          }
+          else {
+            // convert file uri to the full url
+            $eary['uri'] = file_create_url($eary['uri']);
+          }
+          // add values based on wrapper passing correctly
+          $val = $eary;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements threeplaymedia_apicall_alter().
+ */
+function elmsmedia_helper_threeplaymedia_apicall_alter(&$data, $call) {
+  // call to send_file
+  if ($call == 'send_file') {
+    $media = node_load($data['video_id']);
+    // see if course id is set, load it if it is
+    // this helps with organizing batches on the other side
+    if (!empty($media->field_cis_course_ref) && isset($media->field_cis_course_ref['und'][0]['target_id'])) {
+      $course = node_load($media->field_cis_course_ref['und'][0]['target_id']);
+      $data['batch_name'] = $course->field_course_machine_name['und'][0]['safe_value'];
+    }
+    else {
+      $data['batch_name'] = t('no_course');
+    }
+  }
+}

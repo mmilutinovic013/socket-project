@@ -1,0 +1,115 @@
+<?php
+
+/**
+ * Implements hook_install().
+ *
+ * Perform actions to set up the site for this profile.
+ */
+function cle__2_install() {
+  // load the installer inlcude file
+  module_load_include('inc', 'cis_connector', 'includes/elmsln.install');
+  // do some initial clean up from the install
+  _elmsln_installer_preflight(TRUE);
+  // to standard theme routine
+  _elmsln_installer_theme('cle_foundation_access');
+  // establish admin role
+  _elmsln_installer_admin_role();
+  // standard clean up
+  _elmsln_installer_post_install_cleanup();
+
+  // set homepage
+  variable_set('site_frontpage', 'cle');
+  // last ditch revert
+  features_revert_module('cle_critique');
+  features_revert_module('cle_submission');
+}
+
+/**
+ * Implements hook_update_N().
+ */
+function cle__2_update_7000(&$sandbox) {
+  features_revert_module('cle_assignment');
+  features_revert_module('cle_submission');
+  features_revert_module('cle_project');
+}
+
+/**
+ * Get assignment and assignment link placement better
+ */
+function cle__2_update_7001(&$sandbox) {
+  features_revert_module('cle_assignment');
+  features_revert_module('cle_submission');
+  features_revert_module('cle_cis_ux');
+  // new homepage as app is stable!
+  variable_set('site_frontpage', 'cle');
+  // shouldn't have been enabled in 2.x version
+  module_disable(array('cle_require_profile'));
+}
+
+/**
+ * Get appropriate settings in field options for cle_assignment.
+ */
+function cle__2_update_7002(&$sandbox) {
+  features_revert_module('cle_assignment');
+  features_revert_module('cle_submission');
+  variable_set('site_frontpage', 'cle');
+}
+
+/**
+ * Minor settings standardization for available artifacts
+ */
+function cle__2_update_7003(&$sandbox) {
+  features_revert_module('cle_assignment');
+  features_revert_module('cle_submission');
+  features_revert_module('cle_project');
+}
+
+/**
+ * Major permissions refactor to ensure everyone can do what they
+ * need to do.
+ */
+function cle__2_update_7004(&$sandbox) {
+  features_revert_module('cle_assignment');
+  features_revert_module('cle_submission');
+  features_revert_module('cle_project');
+  features_revert_module('cle_perms');
+  features_revert_module('cle_section');
+  // rebuild permissions because many change at this point
+  node_access_rebuild();
+}
+
+/**
+ * Build styles dynamically on image field usage.
+ */
+function cle__2_update_7005(&$sandbox) {
+  features_revert_module('cle_cis_ux');
+}
+
+/**
+ * Add comment permissions and submission field for future sidecomment.js support
+ */
+function cle__2_update_7006(&$sandbox) {
+  features_revert_module('cle_perms');
+  features_revert_module('cle_submission');
+}
+
+/**
+ * xAPI tracking for view / duration stuff at least
+ */
+function cle__2_update_7007(&$sandbox) {
+  module_enable(array('elmsln_lrs'));
+}
+
+/**
+ * CLE Submission data model has an additional field for critique
+ */
+function cle__2_update_7008(&$sandbox) {
+  features_revert_module('cle_submission');
+}
+
+/**
+ * CLE permissions default to let authed users see stuff... duh.
+ */
+function cle__2_update_7009(&$sandbox) {
+  features_revert_module('cle_perms');
+}

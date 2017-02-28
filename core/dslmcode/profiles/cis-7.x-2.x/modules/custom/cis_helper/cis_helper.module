@@ -1,0 +1,1681 @@
+<?php
+/**
+ * @file
+ * Workflow and functionality glue based on the structure of the CIS.
+ */
+// default service to select for site creation.
+define('CIS_HELPER_COURSE_SERVICE', 'courses');
+// machine_name to indicate that  service is external to the system.
+define('CIS_HELPER_EXTERNAL_FLAG', '--external--');
+// server location of the jobs path for files to be written to.
+define('CIS_HELPER_JOB_PATH', '/var/www/elmsln/config/jobs');
+// default authentication method of newly created courses / sites.
+define('CIS_HELPER_DEFAULT_AUTHENTICATION', 'lms');
+// default instructional outline to import into mooc instance.
+define('CIS_HELPER_DEFAULT_CONTENT_OUTLINE', 'lesson-based.xml');
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function cis_helper_module_implements_alter(&$implementations, $hook) {
+  switch ($hook) {
+    case 'cron':
+      // shift this cron call to the last thing to process since it kicks
+      // off a non-blocking job in the background. This also allows other
+      // systems to sync up with CIS via other cron routines before firing
+      // off our network wide snake sync
+      $group = $implementations['cis_helper'];
+      unset($implementations['cis_helper']);
+      $implementations['cis_helper'] = $group;
+    break;
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function cis_helper_cron() {
+  // section list that's active to see if we need to process anything
+  $query = new EntityFieldQuery;
+  $result = $query
+    // pull all field collections
+    ->entityCondition('entity_type', 'field_collection_item')
+    // that are sections
+    ->entityCondition('bundle', 'field_sections')
+    // that aren't archived
+    ->propertyCondition('archived', 0)
+    // that have something in the cis_ops field
+    ->fieldCondition('field_cis_ops', 'value', 'NULL', '!=')
+    // run as user 1 to avoid issues of ability to load as cron is anon
+    ->addMetaData('account', user_load(1))
+    ->execute();
+  // load the instances
+  if (isset($result['field_collection_item'])) {
+    $sections = entity_load('field_collection_item', array_keys($result['field_collection_item']));
+    if (drupal_is_cli()) {
+      // debug message if this gets backed up
+      drush_print(dt('Sections to process.. @count', array('@count' => count($sections))));
+    }
+    foreach ($sections as $section) {
+      // handle the logic of the operation to perform
+      // make sure we have an offering and course
+      if (is_object($section->HostEntity()) && is_object($section->HostEntity()->HostEntity())) {
+        _cis_helper_run_operation($section);
+      }
+    }
+  }
+  // sync up the network
+  _cis_helper_sync_network();
+}
+
+/**
+ * Callback to sync the entire network and make it happy with
+ * courses, sections and user accounts going.... EVERYWHERE.
+ */
+function _cis_helper_sync_network() {
+  // make a list of courses as a queue
+  $query = new EntityFieldQuery;
+  $result = $query
+    // pull all nodes
+    ->entityCondition('entity_type', 'node')
+    // that are courses
+    ->entityCondition('bundle', 'course')
+    // that aren't archived
+    ->propertyCondition('status', 1)
+    // run as user 1 to avoid issues of ability to load as cron is anon
+    ->addMetaData('account', user_load(1))
+    ->execute();
+  // load the instances
+  if (isset($result['node'])) {
+    if (drupal_is_cli()) {
+      // debug message if this gets backed up
+      drush_print(dt('Courses to process.. @count', array('@count' => count($result['node']))));
+    }
+    // make a queue for this
+    $queue = DrupalQueue::get('cis_course_process');
+    $queue->createQueue();
+    foreach ($result['node'] as $course) {
+      // ensure machine_name isset
+      if (isset($course->nid)) {
+        $queue->createItem($course->nid);
+      }
+    }
+    // ensure we have stuff in the queue before trying this
+    if ($queue->numberOfItems() > 0) {
+      // now kick off a call to do roster syncing that kicks the next item off the queue
+      // at the end of it
+      $nonblock = array(
+        'method' => 'POST',
+        'api' => '1',
+        'bucket' => 'cis',
+        'path' => '/',
+        'data' => array(
+          'elmsln_module' => 'cis_helper',
+          'elmsln_callback' => 'populate_course_network',
+          'queue' => TRUE,
+        ),
+      );
+      _elmsln_api_nonblocking_requests(array($nonblock));
+    }
+  }
+}
+
+/**
+ * Derive section access strings from a course.
+ * @param  object $course   course node object.
+ * @return array            array of strings to pass off to section request area.
+ */
+function _cis_helper_course_access_strings($course) {
+  $section_list = array();
+  // load up offerings
+  if (isset($course->field_offerings[LANGUAGE_NONE])) {
+    $temp_entity_ids = array();
+    foreach ($course->field_offerings[LANGUAGE_NONE] as $temp_item) {
+      $temp_entity_ids[] = $temp_item['value'];
+    }
+    $offerings = entity_load('field_collection_item', $temp_entity_ids);
+    // loop through offerings
+    foreach ($offerings as $offering) {
+      // load up sections
+      if (isset($offering->field_sections[LANGUAGE_NONE])) {
+        $temp_entity_ids = array();
+        foreach ($offering->field_sections[LANGUAGE_NONE] as $temp_item) {
+          $temp_entity_ids[] = $temp_item['value'];
+        }
+        $sections = entity_load('field_collection_item', $temp_entity_ids);
+        // setp into each section found
+        foreach ($sections as $section) {
+          if (isset($section->field_access_string[LANGUAGE_NONE])) {
+            // loop through access strings
+            foreach ($section->field_access_string[LANGUAGE_NONE] as $access_string) {
+              $section_list[$access_string['value']] = $section;
+            }
+          }
+        }
+      }
+    }
+  }
+  return $section_list;
+}
+
+/**
+ * Assemble a roster based on a list of sections
+ * keyed as section_id => field_collection_item
+ */
+function _cis_helper_assemble_roster(&$sections) {
+  // build roster based on an array of sections
+  $roster = array();
+  foreach ($sections as $section_id => &$section) {
+    // mark all sections active, last case of date after course runs is
+    // the only case that can deactivate a section
+    $section->active = 1;
+    // ensure we only sync things that should be sycned
+    // this helps elminate purely developmental section spaces like masters
+    // as well as sections primed for setup but not active
+    // as the per the semester dates
+    if (isset($section->field_access_dates['und'])) {
+      $dates = $section->field_access_dates['und'][0];
+      // convert date stamps to unix time stamps for comparison to now
+      $date = new DateTime($dates['value']);
+      $dates['value'] = $date->getTimestamp();
+      $date = new DateTime($dates['value2']);
+      $dates['value2'] = $date->getTimestamp();
+      if ($dates['value'] < REQUEST_TIME && $dates['value2'] > REQUEST_TIME) {
+        // build the roster for this section
+        $tmproster = module_invoke_all('cis_helper_build_roster', $section_id);
+        // allow for altering roster pull methods
+        drupal_alter('cis_helper_build_roster', $tmproster, $section_id);
+        $roster[$section_id] = $tmproster;
+      }
+      // test for it being before a section is active / is running
+      // this helps ensure students don't get access early but if
+      // instructors or teaching assistants come across the API it adds them
+      elseif ($dates['value'] > REQUEST_TIME) {
+        // build the roster for this section
+        $tmproster = module_invoke_all('cis_helper_build_roster', $section_id);
+        // allow for altering roster pull methods
+        drupal_alter('cis_helper_build_roster', $tmproster, $section_id);
+        foreach ($tmproster as $uname => $urole) {
+          // don't grant students early access but still give them an account
+          // this way our roster totals / accounts show up but they don't gain
+          // the student role until the time they are supposed to.
+          // it also enables them to access the welcome letter and other
+          // CIS delivered logistical information.
+          if ($urole == 'student') {
+            $tmproster[$uname] = 'authenticated user';
+          }
+        }
+        $roster[$section_id] = $tmproster;
+      }
+      // section has ended, deactivate it downstream
+      elseif ($dates['value2'] < REQUEST_TIME) {
+        $section->active = 0;
+        $roster[$section_id] = array();
+      }
+    }
+    else {
+      // build the roster for this section
+      $tmproster = module_invoke_all('cis_helper_build_roster', $section_id);
+      // allow for altering roster pull methods
+      drupal_alter('cis_helper_build_roster', $tmproster, $section_id);
+      $roster[$section_id] = $tmproster;
+    }
+  }
+  return $roster;
+}
+
+/**
+ * Callback to run operational logic for a remote call that was requested.
+ *
+ * This allows for additional global operations to be written back to
+ * the CIS from other places via the field_cis_ops field. 'set' is the
+ * current allowed operation which allows other sites in the network
+ * to define that a remote service should save a file locally and set
+ * it to the field defined in the call's field.
+ *
+ * @param $section
+ *   fully loaded field_collection_item entity that has an operation to run.
+ */
+function _cis_helper_run_operation($section) {
+  $call = unserialize($section->field_cis_ops[LANGUAGE_NONE][0]['value']);
+  switch ($call['op']) {
+    // allow fields to be set and written to data files
+    case 'set':
+      // grab the semester, year and course
+      $semester = $section->HostEntity()->field_semester[LANGUAGE_NONE][0]['value'];
+      $year = $section->HostEntity()->field_year[LANGUAGE_NONE][0]['value'];
+      $course_name = $section->HostEntity()->HostEntity()->field_machine_name[LANGUAGE_NONE][0]['value'];
+      // build registry for this setting
+      $settings = _cis_connector_build_registry($call['bucket']);
+      // build the address to do a secure call over webservices
+      $address = _cis_connector_format_address($settings, '/' . $course_name);
+      // execute the request
+      httprl_request($address . '/' . $call['url']);
+      $request = httprl_send_request();
+      // pull out the data from this call
+      $xml = array_pop($request)->data;
+      // load the structure of the field so we can get the storage location
+      $field = field_info_field('field_course_archive');
+      // get the instance settings so we can get the directory
+      $instance = field_info_instance('field_collection_item', 'field_course_archive', 'field_sections');
+      // file path
+      $file_base = $field['settings']['uri_scheme'] . '://';
+      if (isset($instance['settings']['file_directory']) && !empty($instance['settings']['file_directory'])) {
+        $file_base .= $instance['settings']['file_directory'] . '/';
+      }
+      $file_path = $file_base . $course_name . '_' . $semester . '_' . $year . '.xml';
+      // test that we can actually save the file
+      if ($file = file_save_data($xml, $file_path)) {
+        // Change status to permanent so it isn't killed on cron clean up
+        $file->status = FILE_STATUS_PERMANENT;
+        // bulk job so set uid to 1 since it's site ownership and non anon
+        $file->uid = 1;
+        $file->filename = str_replace($file_base, '', $file->uri);
+        $file->display = 1;
+        $file->description = '';
+        $file->focus_rect = '';
+        $file->crop_rect = '';
+        $file->rdf_mapping = array();
+        // save file
+        file_save($file);
+        // silly typecast of file object to array for field happiness
+        $file_ary = (array)$file;
+        // set the section's file field to match file array
+        $section->{$call['field']}[LANGUAGE_NONE][0] = $file_ary;
+        // clear the operation field so this doesn't run next time
+        $section->field_cis_ops[LANGUAGE_NONE][0]['value'] = NULL;
+        // save the section
+        entity_save('field_collection_item', $section);
+      }
+    break;
+  }
+}
+
+/**
+ * Implements hook_user_login().
+ */
+function cis_helper_user_login(&$edit, $account) {
+  // If this is user's first time log-in, kill the open log file for security
+  // and present them a message about how to get started.
+  if ($account->uid == 1 && $account->access == 0 && !drupal_is_cli()) {
+    $cfg = _elmsln_core_get_cfg();
+    $settings = _cis_connector_build_registry(elmsln_core_get_profile_key());
+    $text = t('You have successfully logged in, congratulations!') . "\n";
+    $text .= t('If you are seeing this, then you probably want to go elsewhere since the installation is complete.') . "\n";
+    $text .= t('To login, go to any site in your network, such as:') . "\n";
+    $text .= t('<a href="@url">@url</a>', array('@url' => _cis_connector_format_address($settings, '/', 'front')));
+    $text .= "\n" . t('and login.') . "\n";
+    $text .= t('If you are locked out of your deployment, you can regain access server side by running the following:') . "\n";
+    $text .= "\n" . '         drush @online uli' . "\n";
+    $text .= t('This will generate a one time login link.');
+    file_put_contents($cfg['drupal_tmp'] . '/INSTALL-LOG.txt', $text);
+    drupal_set_message(t('Welcome to ELMS:LN! To get started, you probably want to add a course. To do this, click the plus sign at the bottom and select `Setup a Course`'), 'status');
+  }
+}
+
+/**
+ * Implements hook_page_build().
+ */
+function cis_helper_page_build(&$page) {
+  drupal_add_css(drupal_get_path('module', 'cis_helper') . '/css/cis_helper.css');
+  $node = menu_get_object();
+  if (arg(0) == 'cis-add-offering') {
+    drupal_add_css(drupal_get_path('module', 'cis_helper') . '/css/cis_helper_add_offering_page.css');
+  }
+  elseif (arg(0) == 'cis-quick-setup') {
+    // special js for hiding / displaying groups of form fields
+    drupal_add_js(drupal_get_path('module', 'cis_helper') . '/js/cis_helper.js');
+  }
+}
+
+/**
+ * Implements hook_page_alter().
+ */
+function cis_helper_page_alter(&$page) {
+ // build shortcuts to create other services, excluding current ones
+  if (arg(2) == 'service-instances' && is_numeric(arg(1))) {
+    $key = array('field_services', 'target_id');
+    $fields = array('field_course' => array('target_id', arg(1)));
+    // build a list of current services
+    $current = _cis_connector_assemble_entity_list('node', 'service_instance', $key, 'title', $fields);
+    $services = _cis_connector_assemble_entity_list('node', 'service', 'nid', 'title');
+    foreach ($current as $k => $t) {
+      unset($services[$k]);
+    }
+    $links = '<div class="cis-create-additional-services">' . "\n<ul>\n";
+    foreach ($services as $snid => $name) {
+      $options = array(
+        'query' => array(
+          'field_services' => $snid,
+          'field_course' => arg(1),
+          'destination' => current_path(),
+        )
+      );
+      $links .= '<li>' . l(t('Add `@service` service', array('@service' => $name)), 'node/add/service-instance', $options) . "</li>\n";
+    }
+    $links .= "\n</ul>\n</div>";
+    $page['content']['system_main']['main']['#markup'] .= $links;
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function cis_helper_theme($existing, $type, $theme, $path) {
+  return array(
+    'cis_helper_checkbox_table' => array(
+      'render element' => 'element',
+    ),
+  );
+}
+
+/**
+ * Theme callback to render checkboxes as a table.
+ *
+ * @param $variables
+ *   an element with checkboxes which will be rendered as rows.
+ */
+function theme_cis_helper_checkbox_table($variables) {
+  $element = $variables['element'];
+  $rows = array();
+  $row = array();
+  foreach (element_children($element) as $n => $key) {
+    $row[] = drupal_render($element[$key]);
+    // 5 can be replaced by number of checkboxes you want in one row.
+    if ($n+1 == count($element['#options']) || ($n+1) % 5 == 0) {
+      $rows[] = $row;
+      $row = array();
+    }
+  }
+  return theme('table', array('header' => array(), 'rows' => $rows, 'attributes' => array('class' => array('cis_course_table_list'))));
+}
+
+/**
+ * Implements hook_menu().
+ */
+function cis_helper_menu() {
+  $items = array();
+  $path = drupal_get_path('module', 'cis_helper');
+  // sync
+  $items['node/%node/sync-roster'] = array(
+    'title' => 'Sync Roster',
+    'description' => 'Sync the roster for this course',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cis_helper_sync_network_roster_confirm'),
+    'access callback' => '_cis_helper_sync_roster_node_access',
+    'access arguments' => array('update', 1),
+    'type' => MENU_LOCAL_TASK,
+    'context' => MENU_CONTEXT_PAGE | MENU_CONTEXT_INLINE,
+    'file' => 'cis_helper.pages.inc',
+    'file path' => $path,
+  );
+  // admin settings for CIS
+  $items['admin/config/system/cis'] = array(
+    'title' => 'CIS',
+    'description' => 'Course information system configuration',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cis_helper_admin_settings'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'cis_helper.admin.inc',
+    'file path' => $path,
+  );
+  // admin settings for CIS
+  $items['admin/config/system/integrations'] = array(
+    'title' => 'Global integrations',
+    'description' => 'Integrations page for ELMS:LN',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cis_helper_integrations_settings'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'cis_helper.admin.inc',
+    'file path' => $path,
+    'menu_name' => 'menu-elmsln-settings',
+    'weight' => 10,
+  );
+  // quick setup form
+  $items['cis-quick-setup'] = array(
+    'title' => 'Setup a course',
+    'description' => 'Setup a new course and plug it into the network of tools',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cis_helper_quick_setup_page'),
+    'access arguments' => array('access cis setup form'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'cis_helper.pages.inc',
+    'file path' => $path,
+    'menu_name' => 'menu-elmsln-add',
+    'weight' => 10,
+  );
+  // add offering form
+  $items['cis-add-offering'] = array(
+    'title' => 'Course offering',
+    'description' => 'Setup an offering / semester for an existing course',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cis_helper_add_offering_page'),
+    'access arguments' => array('access cis setup form'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'cis_helper.pages.inc',
+    'file path' => $path,
+    'menu_name' => 'menu-elmsln-add',
+    'weight' => 9,
+  );
+  // quick setup form from a string, useful with LTI prepopulation
+  $items['cis-quick-setup-access-id'] = array(
+    'title' => 'Setup semester access',
+    'description' => 'Setup access to a space based on having the unique string.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cis_helper_quick_setup_access_id_page'),
+    'access arguments' => array('access cis setup form'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'cis_helper.pages.inc',
+    'file path' => $path,
+  );
+  return $items;
+}
+
+/**
+ * Access callback for the roster sync.
+ */
+function _cis_helper_sync_roster_node_access($op, $node) {
+  if ($node->type == 'course') {
+    return node_access($op, $node);
+  }
+  return FALSE;
+}
+
+
+/**
+ * Implements hook_permission().
+ */
+function cis_helper_permission() {
+    return array(
+    'access cis setup form' =>  array(
+      'title' => t('Access cis quick setup form'),
+    ),
+    'cis setup admin options' => array(
+      'title' => t('Access administrative options on setup form'),
+    ),
+  );
+}
+
+/**
+ * Implementation of hook_form_service_instance_node_form_alter().
+ */
+function cis_helper_form_service_instance_node_form_alter(&$form, &$form_state, $form_id) {
+  // hide cron key field on node add
+  if (arg(1) == 'add') {
+    $form['field_cron_key']['#attributes']['style'] = 'display:none';
+    if (isset($form_state['entityreference_prepopulate']['node']['service_instance']['field_services']) && isset($form_state['entityreference_prepopulate']['node']['service_instance']['field_course'])) {
+      ;
+      $form['title']['#default_value'] = $form['field_course']['und']['#options'][$form_state['entityreference_prepopulate']['node']['service_instance']['field_course'][0]] . ' - ' . $form['field_services']['und']['#options'][$form_state['entityreference_prepopulate']['node']['service_instance']['field_services'][0]];
+      // disable field cause we already have the value we want
+      $form['title']['#disabled'] = TRUE;
+      $form['field_course']['#disabled'] = TRUE;
+      $form['field_services']['#disabled'] = TRUE;
+    }
+  }
+}
+/**
+ * Implementation of hook_form_field_collection_item_form_alter().
+ */
+function cis_helper_form_field_collection_item_form_alter(&$form, &$form_state, $form_id) {
+  // alterations for the section field collection
+  if (isset($form['#entity']) && $form['#entity']->field_name == 'field_sections') {
+    // return all service instances this section will have access to
+    $service_instances = _cis_helper_derive_service_instances($form['#entity']->item_id, $form['#entity']->HostEntity()->HostEntity());
+    // we need to replace the service options based on those that exist
+    $service_options = array('' => t('- None -'));
+    // load each service related to the instances found
+    if (is_array($service_instances)) {
+      foreach ($service_instances as $instance) {
+        $service = node_load($instance->field_services[LANGUAGE_NONE][0]['target_id']);
+        // collect array of known services available to this course via instances
+        $service_options[$service->nid] = $service->title;
+        $defaults[] = $service->nid;
+      }
+    }
+    // set the allowed options to those found above
+    $form['field_services'][LANGUAGE_NONE]['#options'] = $service_options;
+    if (empty($form['field_services'][LANGUAGE_NONE]['#default_value'])) {
+      $form['field_services'][LANGUAGE_NONE]['#default_value'] = $defaults;
+    }
+  }
+}
+
+/**
+ * Implementation of hook_form_views_exposed_form_alter().
+ */
+function cis_helper_form_views_exposed_form_alter(&$form, &$form_state, $form_id) {
+  // courses overview view / display
+  if (arg(0) == 'courses' && $form_state['view']->name == 'courses_overview') {
+    $form['filterwrapper'] = array(
+      '#weight' => 0,
+      '#type' => 'fieldset',
+      '#materialize' => array(
+        'type' => 'collapsible_wrapper'
+      ),
+      '#attributes' => array(
+        'class' => array('collapsible'),
+        'data-collapsible' => 'accordion',
+      )
+    );
+    // add nice html5 placeholders
+    $form['title']['#placeholder'] = t('Find a course');
+    // course_num container
+    $form['filterwrapper']['titlewrapper'] = array(
+      '#materialize' => array(
+        'type' => 'collapsible',
+      ),
+      '#attributes' => array(
+        'class' => array('active'),
+      ),
+      '#type' => 'fieldset',
+      '#title' => t('Course name'),
+      '#collapsible' => TRUE,
+      '#collapsed' => FALSE,
+      '#weight' => 0,
+    );
+    $form['filterwrapper']['titlewrapper']['title'] = $form['title'];
+    unset($form['title']);
+    $form['#info'] = array();
+    $form['title_1']['#placeholder'] = t('Enter a number');
+    // course_num container
+    $form['filterwrapper']['course_num'] = array(
+      '#materialize' => array(
+        'type' => 'collapsible',
+      ),
+      '#type' => 'fieldset',
+      '#title' => t('Course number'),
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+      '#weight' => 1,
+    );
+    $form['filterwrapper']['course_num']['title_1'] = $form['title_1'];
+    unset($form['title_1']);
+    // field_academic_home_target_id container
+    $form['filterwrapper']['academic_home'] = array(
+      '#materialize' => array(
+        'type' => 'collapsible',
+      ),
+      '#type' => 'fieldset',
+      '#title' => t('Academic home'),
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+      '#weight' => 2,
+    );
+    $form['filterwrapper']['academic_home']['field_academic_home_target_id'] = $form['field_academic_home_target_id'];
+    unset($form['field_academic_home_target_id']);
+    // field_program_classification_target_id container
+    $form['filterwrapper']['program'] = array(
+      '#materialize' => array(
+        'type' => 'collapsible',
+      ),
+      '#type' => 'fieldset',
+      '#title' => t('Course number'),
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+      '#weight' => 3,
+    );
+    $form['filterwrapper']['program']['field_program_classification_target_id'] = $form['field_program_classification_target_id'];
+    unset($form['field_program_classification_target_id']);
+  }
+  // faculty overview view / display
+  if (arg(0) == 'faculty' && $form_state['view']->name == 'cis_faculty') {
+    // add nice html5 placeholders
+    $form['field_display_name_value']['#placeholder'] = t('Search for faculty');
+  }
+  // add quick link to add offering to the list of offerings
+  if (arg(2) == 'offerings') {
+    $form['cle_add_new']['#markup'] = l(t('Add new offering'), 'field-collection/field-offerings/add/node/' . arg(1), array('query' => array('destination' => 'node/' . arg(1) . '/offerings')));
+    $form['cle_add_new']['#weight'] = 100;
+  }
+}
+
+/**
+ * Implements hook_entity_presave().
+ */
+function cis_helper_entity_presave($entity, $type) {
+  // check to see if a service_instance is being saved
+  if ($type == 'node' && $entity->type == 'service_instance') {
+    // force title to match pattern, ant may miss this
+    $serv_node = node_load($entity->field_services[LANGUAGE_NONE][0]['target_id']);
+    // load the course node
+    $course_node = node_load($entity->field_course[LANGUAGE_NONE][0]['target_id']);
+    $entity->title = $course_node->field_machine_name[LANGUAGE_NONE][0]['value'] . ' - ' . $serv_node->field_machine_name[LANGUAGE_NONE][0]['value'];
+  }
+  elseif ($type == 'field_collection_item' && $entity->field_name == 'field_sections' && !empty($entity->HostEntity())) {
+    $course = $entity->HostEntity()->HostEntity();
+    // wierd crap where course isn't somehow the HostEntity of the host here
+    // this seems like a caching race condition of some kind, possibly caused by APDQC
+    // saving the relationship in a background thread. Doesn't happen all the time and
+    // doesn't seem to have any reason behind when it does happen
+    if (empty($course)) {
+      $query = new EntityFieldQuery;
+      $result = $query
+      // pull all nodes
+      ->entityCondition('entity_type', 'node')
+      // that are service instances
+      ->entityCondition('bundle', 'course')
+      // where there is an offering that is the parent of this one
+      ->fieldCondition('field_offerings', 'value', $entity->HostEntity()->item_id, '=')
+      ->execute();
+      // load the instances
+      if (isset($result['node'])) {
+        $node = array_pop($result['node']);
+        $course = node_load($node->nid);
+      }
+    }
+    // account for sections that don't have targets yet should, let's just set them to all
+    if (!empty($course) && !isset($entity->field_services['und']) || $entity->field_services['und'][0]['target_id'] == 0) {
+      $entity->field_services['und'] = array();
+      $service_instances = _cis_helper_derive_service_instances(NULL, $course);
+      if (is_array($service_instances) && !empty($service_instances)) {
+        foreach ($service_instances as $instance) {
+          $service = node_load($instance->field_services[LANGUAGE_NONE][0]['target_id']);
+          $entity->field_services[LANGUAGE_NONE][] = array('target_id' => $service->nid);
+        }
+      }
+    }
+    // trim white space from input of strings
+    if (isset($entity->field_access_string[LANGUAGE_NONE])) {
+      // loop through access strings
+      foreach ($entity->field_access_string[LANGUAGE_NONE] as $access_key => $access_string) {
+        $entity->field_access_string[LANGUAGE_NONE][$access_key]['value'] = trim($entity->field_access_string[LANGUAGE_NONE][$access_key]['value']);
+      }
+    }
+  }
+  // account for anything with a machine name field as these are textfields
+  if (isset($entity->field_machine_name)) {
+    $old = $entity->field_machine_name[LANGUAGE_NONE][0]['value'];
+    $new = preg_replace("/[^a-z_0-9]+/", "", drupal_strtolower($old));
+    $entity->field_machine_name[LANGUAGE_NONE][0]['value'] = $new;
+    if ($new != $old) {
+      drupal_set_message(t('The machine name `@old` was changed to `@new`.', array('@old' => $old, '@new' => $new)));
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function cis_helper_entity_insert($entity, $type) {
+  // act on nodes
+  if ($type == 'node' && $entity->type == 'course') {
+    // sync the service but do it non-blocking
+    $request = array(
+      'method' => 'POST',
+      'api' => '1',
+      'bucket' => 'cis',
+      'path' => '/',
+      'data' => array(
+        'elmsln_module' => 'cis_helper',
+        'elmsln_callback' => 'populate_course_network',
+        'course' => $course->field_machine_name[LANGUAGE_NONE][0]['value'],
+      ),
+    );
+    _elmsln_api_request($request, TRUE);
+    // ensure that course name is changed globally if updated anywhere
+    $properties = array(
+      'title' => $entity->title,
+      'slogan' => $entity->field_course_title['und'][0]['value'],
+      'machine_name' => $entity->field_machine_name[LANGUAGE_NONE][0]['value'],
+      'uuid' => $entity->uuid,
+    );
+    _elmsln_api_course_sync($properties, '1', TRUE);
+  }
+  // check to see if a service_instance is being inserted
+  if ($type == 'node' && $entity->type == 'service_instance') {
+    // set the entity reference field to course
+    global $user;
+    // generally a bad idea to pass around the user global
+    $account = $user;
+    // only run if we have services to process
+    if (!empty($entity->field_services[LANGUAGE_NONE])) {
+      $serv_node = node_load($entity->field_services[LANGUAGE_NONE][0]['target_id']);
+      $course_node = node_load($entity->field_course[LANGUAGE_NONE][0]['target_id']);
+      // get current college machine name
+      $college = variable_get('cis_college_name', '');
+      // make sure this isn't marked external
+      if ($serv_node->field_machine_name[LANGUAGE_NONE][0]['value'] != CIS_HELPER_EXTERNAL_FLAG) {
+        _cis_helper_add_service_instance($course_node, $serv_node, $entity, $college, $account);
+      }
+    }
+  }
+  // spider associated services when section is updated
+  if ($type == 'field_collection_item' && $entity->field_name == 'field_sections' && !empty($entity->HostEntity())) {
+    $course = $entity->HostEntity()->HostEntity();
+    $requests = array(
+        array(
+        'elmsln_module' => 'elmsln_api',
+        'elmsln_callback' => 'clear_cache_bin',
+        'bin' => 'cis_connector',
+        'cid' => 'elmsln:cis:field_collection_item',
+      ),
+    );
+    // ship these requests across the network
+    _elmsln_api_network_request($requests, 1, TRUE);
+    // sync the service but do it non-blocking
+    $request = array(
+      'method' => 'POST',
+      'api' => '1',
+      'bucket' => 'cis',
+      'path' => '/',
+      'data' => array(
+        'elmsln_module' => 'cis_helper',
+        'elmsln_callback' => 'populate_course_network',
+        'course' => $course->field_machine_name[LANGUAGE_NONE][0]['value'],
+      ),
+    );
+    _elmsln_api_request($request, TRUE);
+    drupal_set_message(t('The course network for `@course` has been syncronized to reflect your changes.', array('@course' => $course->title)), 'notification');
+  }
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function cis_helper_entity_update($entity, $type) {
+  // tap authorities if any key properties are updated
+  if ($type == 'node' && $entity->type == 'course') {
+    // ensure that course name is changed globally if updated anywhere
+    $properties = array();
+    if (isset($entity->original) && $entity->original->title != $entity->title) {
+      $properties['title'] = $entity->title;
+    }
+    if (isset($entity->original) && $entity->original->field_course_title['und'][0]['value'] != $entity->field_course_title['und'][0]['value']) {
+      $properties['slogan'] = $entity->field_course_title['und'][0]['value'];
+    }
+    // if anything changed let's ship this off everywhere
+    if (!empty($properties)) {
+      _elmsln_api_course_sync($properties, '1', TRUE);
+    }
+  }
+  // spider associated services when section is updated
+  if ($type == 'field_collection_item' && $entity->field_name == 'field_sections' && !empty($entity->HostEntity())) {
+    // get basePath from the hostEntity course
+    $course = $entity->HostEntity()->HostEntity();
+    $path = '/' . $course->field_machine_name[LANGUAGE_NONE][0]['value'] . '/';
+    $requests = array(
+        array(
+        'elmsln_module' => 'elmsln_api',
+        'elmsln_callback' => 'clear_cache_bin',
+        'bin' => 'cis_connector',
+        'cid' => 'elmsln:cis:field_collection_item',
+      ),
+    );
+    // ship these requests across the network
+    _elmsln_api_network_request($requests, 1, TRUE, $path);
+  }
+}
+
+/**
+ * Helper function to trigger cron based service creation.
+ *
+ * This is the main function that allows the CIS distro to
+ * spin up new sites of other distribution types.  The contains
+ * all logic and general structure for creating the file pattern
+ * needed to be picked up by the drush-create-site process running
+ * on the server.
+ *
+ * @param $course
+ *   fully loaded course node.
+ * @param $service
+ *   fully loaded service node.
+ * @param $service_instance
+ *   fully loaded service_instance node
+ * @param $college
+ *   abreviation for a college, pulled from variables table.
+ * @param $account
+ *   fully loaded user account that requested this be built.
+ * @return NULL
+ *   This returns nothing but does write a file to server to build a site.
+ * @see cis_helper_entity_insert()
+ * @see hook_service_instance_options_alter()
+ */
+function _cis_helper_add_service_instance($course, $service, $service_instance, $college, $account) {
+  $options = array();
+  // allow for advanced drush alterations via code
+  drupal_alter('cis_service_instance_options', $options, $course, $service);
+  // allow for tool machine name specific alterations
+  drupal_alter('cis_service_instance_' . $service->field_machine_name[LANGUAGE_NONE][0]['value'] . '_options', $options, $course, $service);
+  // vset the uuid from the service_instance entity into the remote site
+  // this effectively binds the remote drupal site to the service_instance
+  // content type in CIS
+  $options['vset'][] = 'cis_service_instance_uuid ' . $service_instance->uuid;
+  $options['vset'][] = 'cis_course_machine_name ' . $course->field_machine_name[LANGUAGE_NONE][0]['value'];
+  $options['vset'][] = 'cis_course_uuid ' . $course->uuid;
+  // set public files path
+  $options['vset'][] = 'file_public_path sites/' . $service->field_machine_name[LANGUAGE_NONE][0]['value'] . '/' . $college . '/' . $course->field_machine_name[LANGUAGE_NONE][0]['value'] . '/files';
+  // set private files to match the pattern of ELMSLN config directory
+  $options['vset'][] = 'file_private_path /var/www/elmsln/config/private_files/' . $service->field_machine_name[LANGUAGE_NONE][0]['value'] . '/' . $course->field_machine_name[LANGUAGE_NONE][0]['value'];
+  // set temporary files
+  $options['vset'][] = 'file_temporary_path /var/www/elmsln/config/tmp';
+  // load optional cis_helper defined values
+  $extra_options = variable_get('cis_build_' . $course->field_method_of_access[LANGUAGE_NONE][0]['value'], '');
+  if (!empty($extra_options)) {
+    $extra_options = explode(',', $extra_options);
+    // only allow for enabling options from system variable
+    foreach ($extra_options as $eoption) {
+      $options['en'][] = $eoption;
+    }
+  }
+  // build space name based on the requested title
+  $space_name = $course->field_machine_name[LANGUAGE_NONE][0]['value'];
+  // create a file based on service name
+  $filename = $space_name . '.' . $service->field_machine_name[LANGUAGE_NONE][0]['value'];
+  // set title to name of course
+  $site_title = str_replace('&amp;', 'and', $course->title);
+  $site_title = preg_replace("/[^a-zA-Z0-9 ]+/", "", $site_title);
+  // formulate the pattern of the file to what the job wants
+  // site symlink to build
+  $content = $space_name . "\n";
+  // college requesting for dbo / db name
+  $content .= $college . "\n";
+  // get registry for address / service address
+  $distro_settings = _cis_connector_build_registry($service->field_distribution[LANGUAGE_NONE][0]['value']);
+  // domain this is written to
+  $content .= $distro_settings['address'] . "\n";
+  // domain data can be accessed on
+  $content .= $distro_settings['service_address'] . "\n";
+  // title to set for the site name value
+  $content .= $site_title . "\n";
+  // slogan value for the course, make sure one is set
+  $course_title = (isset($course->field_course_title[LANGUAGE_NONE]) ? $course->field_course_title[LANGUAGE_NONE][0]['value'] : $site_title);
+  // sanitize
+  $course_title = str_replace('&amp;', 'and', $course_title);
+  $course_title = preg_replace("/[^a-zA-Z0-9 ]+/", "", $course_title);
+  // add slogan
+  $content .= $course_title . "\n";
+  // email / user requesting account
+  $content .= $account->name . "\n";
+  // email / user requesting account
+  $content .= $account->mail . "\n";
+  // add distribution to create
+  if (isset($options['field_distribution'])) {
+    $content .= $options['field_distribution'] . "\n";
+    unset($options['field_distribution']);
+  }
+  else {
+    $content .= $service->field_distribution[LANGUAGE_NONE][0]['value'] . "\n";
+  }
+  // process potential drush operation lists
+  $fr = '';
+  $un = '';
+  foreach ($options as $op => $commands) {
+    // write each command to the file for this operation
+    $tmp = '';
+    // account for drush commands that we can smash into 1 line for performance
+    switch ($op) {
+      case 'en':
+      case 'dis':
+      case 'fr':
+      case 'pm-uninstall':
+        $tmp .= 'drush ' . $op . ' ' . implode(' ', $commands) . "\n";
+      break;
+      case 'urol':
+        foreach ($commands as $command_role => $command_users) {
+          $tmp .= 'drush urol ' . $command_role . ' ' . implode(',', $command_users) . "\n";
+        }
+      break;
+      default:
+        foreach ($commands as $command) {
+          $tmp .= 'drush ' . $op . ' ' . $command . "\n";
+        }
+      break;
+    }
+    // hold off on fr to after all other operations
+    if ($op == 'fr') {
+      $fr = $tmp;
+    }
+    // same, hold off on uninstall
+    elseif ($op == 'pm-uninstall') {
+      $un = $tmp;
+    }
+    else {
+      $content .= $tmp;
+    }
+  }
+  // push feature revert requests off til the end
+  // this way they actually revert instead of vset / en disrupting them
+  $content .= $fr . $un;
+  // allow for custom last minute additions per service type
+  drupal_alter('cis_service_instance_' . $service->field_machine_name[LANGUAGE_NONE][0]['value'] . '_job_file', $content, $course, $service, $service_instance);
+  // allow for custom last minute additions to all instances
+  drupal_alter('cis_service_instance_job_file', $content, $course, $service, $service_instance);
+
+  // write the structured file to a lower directory
+  $jobfile = variable_get('cis_job_path', CIS_HELPER_JOB_PATH) . '/' . $filename;
+  $handle = fopen($jobfile, 'x+');
+  fwrite($handle, $content);
+  fclose($handle);
+
+  // as well as altering the process entirely so that it can be hijacked by
+  // cloud based implementations...
+  $distro_settings = _cis_connector_build_registry($service->field_distribution[LANGUAGE_NONE][0]['value']);
+  if (isset($distro_settings['ssh'])) {
+    $ssh = $distro_settings['ssh'];
+    // build connection string
+    $connection = $ssh['options'] . ' ' . $ssh['user'] . '@' . $ssh['host'];
+    // execute the command
+    exec("scp $jobfile $connection:$jobfile");
+    // @todo need a way of validating it worked for now lets delete local version
+    // this would require appending something to the filename of the local job
+    // that means it needs to monitor the status of the file by loading it via ssh
+    unlink(variable_get('cis_job_path', CIS_HELPER_JOB_PATH) . '/' . $filename);
+  }
+  // tell user about the service
+  drupal_set_message(t('The "@service" service will be asked to create @space momentarily. You will be emailed when the job is complete.', array('@service' => $service->title, '@space' => $space_name)), 'notification');
+  // log service creation
+  watchdog('cis_service', 'Service ' . $service->title . ' was told to be built for ' . $space_name);
+}
+
+/**
+ * Implements hook_cis_service_instance_job_file_alter().
+ *
+ * @param  string $content          the content of the jobs file
+ * @param  object $course           the course node
+ * @param  object $service          the service node
+ * @param  object $service_instance the service_instance node
+ */
+function cis_helper_cis_service_instance_job_file_alter(&$content, $course, $service, $service_instance) {
+  // send cron key home so that we know this built successfully
+  // and so that we can talk to it. This is critical for future calls
+  // at the moment where we are destructive with our caches.
+  $content .= 'drush cis-sck' . "\n";
+  // run cron to return our cron key / do some clean up
+  $content .= 'drush cron' . "\n";
+  // support apdqc table conversion at run time
+  // this makes our tables run out of memory bin and be super fast
+  // as well as alters table coalation to be fast as well
+  if (module_exists('apdqc')) {
+    $content .= 'drush apdqc' . "\n";
+    $content .= 'drush cc all' . "\n";
+    $content .= 'drush apdqc' . "\n";
+  }
+  // preseed node caches after any potential caching projects are on
+  $content .= 'drush ecl node' . "\n";
+}
+
+/**
+ * Helper function to return a section / offering's associated course
+ *
+ * Wrapper for hunting for hostEntities from an origin entity. This is
+ * useful because of the structure of the course node being.
+ *  -- course
+ *  ---- offering(s)
+ *  ------ section(s)
+ * This allows for easy selection of an offering from a section,
+ * a course from a section or a course from an offering as they
+ * are a specialized entity reference otherwise due to how field_collection
+ * structures related data.
+ *
+ * @param $item_id
+ *   field_collection_item id to search from.
+ * @param $field_collection_type
+ *   type of field collection to search from, section or offering possible.
+ * @param $find
+ *   item to derive from the current item, defaults to course.
+ */
+function _cis_helper_derive_parent($item_id, $field_collection_type = 'section', $find = 'course') {
+  // additional level of searching for a section that matches
+  if ($field_collection_type == 'section') {
+    $section = entity_load_single('field_collection_item', $item_id);
+    $offering = $section->HostEntity();
+  }
+  else {
+    $offering = entity_load_single('field_collection_item', $item_id);
+  }
+  // allow for stopping here if we wanted offering
+  if ($find == 'offering') {
+    return $offering;
+  }
+  // make sure we have something as an offering, edge case
+  if (empty($offering)) {
+    return FALSE;
+  }
+  // make sure we have a course nid set
+  if (isset($offering->HostEntity()->nid)) {
+    return $offering->HostEntity();
+  }
+  return FALSE;
+}
+
+/**
+ * Returns all instructional outlines that are xml packages
+ *
+ * @return $options
+ *   array of options provided by external alter hooks being used.
+ */
+function _cis_helper_get_instructional_outlines() {
+  $options = array();
+  // allow for the inclusion of other instructional models
+  drupal_alter('cis_instructional_outlines', $options);
+  return $options;
+}
+
+/**
+ * Implements hook_cis_instructional_outlines_alter().
+ *
+ * This is CIS's default implementation of the outline list so
+ * that the outlines that come packaged with CIS are made available
+ * by default. Also makes it easier to add other things in down the
+ * road by doing it this way from the start.
+ *
+ * @param $outlines
+ *   an array of options as outline location => name
+ */
+function cis_helper_cis_instructional_outlines_alter(&$outlines) {
+  // lazy scan the included instructional models
+  $directory = opendir(drupal_get_path('module', 'cis_helper') . '/instructional_models');
+  $full_path = drupal_get_path('module', 'cis_helper') . '/instructional_models/';
+  // get each item
+  $files = array();
+  while ($file_name = readdir($directory)) {
+    if (strpos($file_name, '.xml')) {
+      // add the template to the list
+      $files[$full_path . $file_name] = t('@name Instructional Outline', array('@name' => ucwords(str_replace('-', ' ', str_replace('.xml', '', $file_name)))));
+    }
+  }
+  // close directory
+  closedir($directory);
+  // merge the located file outlines in with those present in the site
+  $outlines = array_merge($outlines, $files);
+}
+
+/**
+ * Derive service instances from an entity id.
+ *
+ * Used to figure out what services a node/collection has access to.
+ *
+ * @param $item_id
+ *   field_collection_item's item_id or a course nid
+ * @param $course
+ *   course object to check against, defaults to null to support lookup.
+ * @param $type
+ *   The type associated with this id since it can be field collection or node.
+ *
+ * @return array
+ *   an array fully loaded service_instance nodes, potentially many.
+ */
+function _cis_helper_derive_service_instances($item_id, $course = NULL, $type = 'section') {
+  // load course correctly
+  if (is_null($course) && !is_null($item_id)) {
+    switch ($type) {
+      case 'section':
+      case 'offering':
+        // find related course
+        $course = _cis_helper_derive_parent($item_id, $type);
+      break;
+      case 'course':
+        $course = node_load($item_id);
+      break;
+      // unsupported operation
+      default:
+        return FALSE;
+      break;
+    }
+  }
+  if ($course == NULL) {
+    return FALSE;
+  }
+  // query to return all service instances for this course
+  $query = new EntityFieldQuery;
+  $result = $query
+    // pull all nodes
+    ->entityCondition('entity_type', 'node')
+    // that are service instances
+    ->entityCondition('bundle', 'service_instance')
+    // where the course equals the current one
+    ->fieldCondition('field_course', 'target_id', $course->nid, '=')
+    // run the query as user 1
+    ->addMetaData('account', user_load(1))
+    ->execute();
+  // load the instances
+  if (isset($result['node'])) {
+    return entity_load('node', array_keys($result['node']));
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_profiler_builder_ignore_alter().
+ */
+function cis_helper_profiler_builder_ignore_alter(&$ignore) {
+  // remove cis specific variables from build
+  $ignore[] = 'cis_build_code';
+  $ignore[] = 'cis_build_lms';
+  $ignore[] = 'cis_build_authenticated';
+  $ignore[] = 'cis_build_open';
+  $ignore[] = 'cis_job_path';
+  $ignore[] = 'cis_college_name';
+}
+
+/**
+ * Implements hook_profiler_builder_drush_modules_list_alter().
+ */
+function cis_helper_profiler_builder_drush_modules_list_alter(&$project_data, $machine_name) {
+  // this module is included with the package as it was a sandbox
+  unset($project_data['Views']['views_field_calc']);
+}
+
+/**
+ * Alter the outgoing response.
+ *
+ * @param mixed $response
+ *   The response data being returned by the REST service (not yet serialized).
+ * @param string $function
+ *   The function being called on the REST service.
+ * @param string $format_name
+ *   The name of the format serializing the response.
+ *
+ * related issue https://drupal.org/node/2024603
+ */
+function cis_helper_restws_response_alter(&$response, $function, $format_name) {
+  // specific modifications based common request type
+  if ($format_name == 'json') {
+    if ($function == 'viewResource' || $function == 'queryResource') {
+      // query response is nested, direct access is not
+      if (isset($_GET['deep-load-refs'])) {
+        if ($function == 'queryResource') {
+          foreach ($response['list'] as &$object) {
+            _cis_helper_restws_deep_load($object);
+          }
+        }
+        else {
+          _cis_helper_restws_deep_load($response);
+        }
+      }
+      // @sillyhack to allow for filtering users by role
+      if (isset($_GET['role-filter']) && arg(0) == 'user.json') {
+        $role = $_GET['role-filter'];
+        if (!$r = user_role_load_by_name($role)) {
+          $r = user_role_load($role);
+        }
+        // make sure we have a fully loaded role
+        if ($r) {
+          foreach ($response['list'] as $key => $entity) {
+            // check that this entity has this role associated
+            if (array_search($r->rid, $entity['roles']) === FALSE) {
+              unset($response['list'][$key]);
+            }
+          }
+        }
+        else {
+          drush_log(dt('Invalid role @role defined, ignoring filter', array('@role' => $role)), 'warning');
+        }
+      }
+    }
+    if ($function == 'queryResource') {
+      // meta controller for counting items returned
+      if (isset($_GET['count'])) {
+        $response['count'] = count($response['list']);
+      }
+    }
+    // allow for rendering based on a display_mode
+    if (isset($_GET['display_mode'])) {
+      if ($function == 'viewResource') {
+        $entity_type = arg(0);
+        $entity = menu_get_object($entity_type);
+        $render_array = entity_view($entity_type, array($entity), $_GET['display_mode']);
+        $response['rendered'] = drupal_render($render_array);
+      }
+      elseif (isset($response['list'])) {
+        $arg0 = explode('.', arg(0));
+        $entity_type = $arg0[0];
+        $info = entity_get_info($entity_type);
+        foreach ($response['list'] as &$object) {
+          if (!empty($object[$info['entity keys']['id']])) {
+            $entity = entity_load_single($entity_type, $object[$info['entity keys']['id']]);
+            $render_array = entity_view($entity_type, array($entity), $_GET['display_mode']);
+            $object['rendered'] = drupal_render($render_array);
+          }
+          else {
+            $object['rendered'] = '';
+          }
+        }
+      }
+    }
+    // @sillyhack to convert json object to xml quickly and deliver
+    // the page prior to drupal trying to do so
+    if (isset($_GET['xml-out'])) {
+      // bump this up a level so its similar to .xml request method
+      if (isset($response['list'])) {
+        // figure out the entity_type
+        $arg0 = explode('.', arg(0));
+        $entity_type = $arg0[0];
+        $response[$entity_type] = $response['list'];
+        // unset the old
+        unset($response['list']);
+      }
+      // wrap the whole thing in a list
+      print _cis_helper_getxml(array ('list' => $response));
+      // set content type to XML so browser / others read it as XML
+      drupal_add_http_header('Content-Type', 'application/xml');
+      // end-cap and exit early this way we don't get the callback
+      // that fires off traditional serialization
+      drupal_page_footer();
+      exit;
+    }
+  }
+}
+
+/**
+ * Callback to perform deep load on a base entity
+ *
+ * @param $response
+ *   response about to be sent back for the RestWS query
+ * @return NULL
+ *   this will load additional items into the response, filtering their
+ *   fields based on account access to the deep loaded items.
+ */
+function _cis_helper_restws_deep_load(&$response) {
+  // build list of allowed entity types to deep pull down
+  $allowed = explode(',', $_GET['deep-load-refs']);
+  // allow for deep loading of resources
+  foreach ($response as $key => &$val) {
+    // check for a single resource verses many
+    if (is_array($val) && isset($val[0]['id'])) {
+      // loop through items loading them in
+      foreach ($val as &$item) {
+        if (in_array($item['resource'], $allowed)) {
+          // load the entity
+          $entity = entity_load_single($item['resource'], $item['id']);
+          // ensure they can view this specific item
+          if (entity_access('view', $item['resource'], $entity)) {
+            // create a meta wrapper to act on for entity
+            $wrapper = entity_metadata_wrapper($item['resource'], $entity);
+            // filter out these values
+            $wrap = restws_property_access_filter($wrapper);
+            $eary = (array) $entity;
+            foreach ($eary as $property => $value) {
+              // value needs to be removed as it didn't pass wrapper validation
+              if (!isset($wrap[$property])) {
+                unset($eary[$property]);
+              }
+            }
+            // CIS SPECIFIC
+            // edge-case unique to cis with nested field collections
+            // the rest of this code is generalized to work with anything
+            if (isset($eary['field_sections'][LANGUAGE_NONE]) && count($eary['field_sections'][LANGUAGE_NONE]) > 0) {
+              // perform deep load of sections
+              foreach ($eary['field_sections'][LANGUAGE_NONE] as &$section) {
+                if ($section['value'] != NULL) {
+                  $section_entity = entity_load_single($item['resource'], $section['value']);
+                  // ensure they can view this specific item
+                  if (entity_access('view', $item['resource'], $section_entity)) {
+                    // create a meta wrapper to act on for entity
+                    $section_wrapper = entity_metadata_wrapper($item['resource'], $section_entity);
+                    // filter out these values
+                    $sec_wrap = restws_property_access_filter($section_wrapper);
+                    $sec_eary = (array) $section_entity;
+                    foreach ($sec_eary as $sec_property => $sec_value) {
+                      // value needs to be removed as it didn't pass wrapper validation
+                      if (!isset($sec_wrap[$sec_property])) {
+                        unset($sec_eary[$sec_property]);
+                      }
+                    }
+                    $section = $sec_eary;
+                  }
+                }
+              }
+            }
+            // add values based on wrapper passing correctly
+            $item = $eary;
+          }
+        }
+      }
+    }
+    elseif (is_array($val) && isset($val['id'])) {
+      if (in_array($val['resource'], $allowed)) {
+        // load the entity
+        $entity = entity_load_single($val['resource'], $val['id']);
+        // ensure they can view this specific item
+        if (entity_access('view', $val['resource'], $entity)) {
+          // create a meta wrapper to act on for entity
+          $wrapper = entity_metadata_wrapper($val['resource'], $entity);
+          // filter out fields
+          $wrap = restws_property_access_filter($wrapper);
+          // typecast entity as array for property evaluation
+          $eary = (array) $entity;
+          foreach ($eary as $property => $value) {
+            // value needs to be removed as it didn't pass wrapper validation
+            if (!isset($wrap[$property])) {
+              unset($eary[$property]);
+            }
+          }
+          // add values based on wrapper passing correctly
+          $val = $eary;
+        }
+      }
+    }
+    // special case for files cause they nest differently
+    elseif (is_array($val) && isset($val['file']['id'])) {
+      if (in_array($val['file']['resource'], $allowed)) {
+        // load the entity
+        $entity = entity_load_single($val['file']['resource'], $val['file']['id']);
+        // ensure they can view this specific item
+        if (entity_access('view', $val['file']['resource'], $entity)) {
+          // create a meta wrapper to act on for entity
+          $wrapper = entity_metadata_wrapper($val['file']['resource'], $entity);
+          // filter out fields
+          $wrap = restws_property_access_filter($wrapper);
+          // typecast entity as array for property evaluation
+          $eary = (array) $entity;
+          // these properties don't cause security issues but file entity is
+          // really tricky, especially without file_entity... and even then with
+          // it it can be a pain
+          $file_fix = array(
+            'fid' => 'fid',
+            'uid' => 'uid',
+            'uri' => 'uri',
+            'filename' => 'filename',
+            'filemime' => 'filemime',
+            'filesize' => 'filesize',
+            'status' => 'status',
+            'timestamp' => 'timestamp',
+          );
+          foreach ($eary as $property => $value) {
+            // value needs to be removed as it didn't pass wrapper validation
+            if (!isset($wrap[$property]) && !isset($file_fix[$property])) {
+              unset($eary[$property]);
+            }
+          }
+          $eary['url'] = file_create_url($eary['uri']);
+          // add values based on wrapper passing correctly
+          $val['file'] = $eary;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Evaluate if a section field collection item is active
+ * based on the date that it's asked about.
+ * @param  [type] $section [description]
+ * @return [type]          [description]
+ */
+function _cis_helper_section_is_active($section) {
+  // ensure there are dates in order to tell status
+  if (isset($section->field_access_dates)) {
+    $section_dates = $section->field_access_dates['und'][0];
+    $class_begin = $section->field_access_dates['und'][0]['value'];
+    // return access start and end timestamps
+    $dates = array('start' => $section_dates['value'], 'class_begin' => $class_begin, 'end' => $section_dates['value2']);
+    if ($dates['start'] < REQUEST_TIME && $dates['end'] > REQUEST_TIME) {
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Callback to generate a service node.
+ *
+ * Generate a service node in CIS based on the fields passed.
+ *
+ * @param $title
+ *   Name of the new service node.
+ * @param $machine_name
+ *   machine name for this service to make its namespace unique
+ * @param $distribution
+ *   Drupal distribution associated with this.
+ * @param $address
+ *   Front facing URL for this system.
+ * @param $data_address
+ *   Backend URL for webservice calls to run over.
+ */
+function _cis_helper_generate_service_node($title, $machine_name, $distribution, $address, $data_address) {
+  $node = new stdClass();
+  $node->type = $type;
+  node_object_prepare($node);
+  $node->language = LANGUAGE_NONE;
+  $node->uid = 1;
+  $node->status = 1;
+  $node->promote = 0;
+  $node->comment = 0;
+  $node->revision = 1;
+  $node->sticky = 0;
+  $node->type = 'service';
+  // values from arguments passed in
+  $node->body['und'][0] = array(
+    'value'      => t("@title is used for..", array('@title' => $title)),
+    'summary'    => '',
+    'format'     => 'textbook_editor',
+  );
+  $node->title = $title;
+  $node->field_machine_name['und'][0]['value'] = $machine_name;
+  $node->field_distribution['und'][0]['value'] = $distribution;
+  // build out via submit then save
+  if($node = node_submit($node)) {
+    node_save($node);
+  }
+  return $node;
+}
+
+/**
+ * Implements hook_httprl_spider_other_paths_alter(&$paths).
+ */
+function cis_helper_httprl_spider_other_paths_alter(&$paths) {
+  $paths[] = 'courses';
+}
+
+/**
+ * Implements hook_elmsln_api_info().
+ */
+function cis_helper_elmsln_api_info() {
+  // populate a course network
+  $callbacks['populate_course_network'] = array(
+    'methods' => array('POST'),
+    'bootstrap' => DRUPAL_BOOTSTRAP_FULL,
+    'file' => 'callbacks/v1/populate_course_network.inc',
+  );
+
+  return $callbacks;
+}
+
+/**
+ * Converts an array to XML
+ *  http://www.devexp.eu/2009/04/11/php-domdocument-convert-array-to-xml/
+ *  @param  <array> $array  The associative array you want to convert; nested numeric indices are OK!
+ */
+function _cis_helper_getxml( array $array ) {
+  $array2XmlConverter  = new CISXmlDomConstructor('1.0', 'utf-8');
+  $array2XmlConverter->xmlStandalone   = TRUE;
+  $array2XmlConverter->formatOutput    = TRUE;
+  try {
+    $array2XmlConverter->fromMixed( $array );
+    $array2XmlConverter->normalizeDocument ();
+    $xml    = $array2XmlConverter->saveXML();
+    return  $xml;
+  }
+  catch( Exception $ex )  {
+    return  $ex;
+  }
+}
+
+/**
+ * Extends the DOMDocument to implement personal (utility) methods.
+ * - From: http://www.devexp.eu/2009/04/11/php-domdocument-convert-array-to-xml/
+ * - parent:: See http://www.php.net/manual/en/class.domdocument.php
+ *
+ * @throws   DOMException   http://www.php.net/manual/en/class.domexception.php
+ *
+ * @author Toni Van de Voorde
+ */
+class CISXmlDomConstructor extends DOMDocument {
+  public function fromMixed($mixed, DOMElement $domElement = null) {
+    $domElement = is_null($domElement) ? $this : $domElement;
+    if (is_array($mixed)) {
+      foreach ($mixed as $index => $mixedElement) {
+        if ( is_int($index) ) {
+          if ( $index == 0 ) {
+            $node = $domElement;
+          }
+          else {
+            $node = $this->createElement($domElement->tagName);
+            $domElement->parentNode->appendChild($node);
+          }
+        }
+        else {
+          $node = $this->createElement($index);
+          $domElement->appendChild($node);
+        }
+        $this->fromMixed($mixedElement, $node);
+      }
+    }
+    else {
+      $domElement->appendChild($this->createTextNode($mixed));
+    }
+  }
+}
+
+
+/**
+ * Implements hook_file_update().
+ */
+function cis_helper_file_update($new_file) {
+  // make sure our uploaded course banners maintain a unified name
+  if (!strpos($new_file->uri, '/banners/')) {
+   return NULL;
+  }
+
+
+  if (!$new_file->fid) {
+    // Nothing to do if no file ID.
+    return NULL;
+  }
+
+  // Check scheme to not interfere with external files.
+  $scheme = file_uri_scheme($new_file->uri);
+  if (!($scheme == 'public' || $scheme == 'private')) {
+    // Return if $scheme is not public or private because
+    // then it is some other scheme like youtube or S3 etc.
+    return NULL;
+  }
+
+  $desired_destination = preg_replace('/_[0-9]+\.(.*)$/', '.$1', $new_file->uri);
+
+  $db_path = db_select('file_managed', 'f')
+    ->fields('f', array('uri'))
+    ->condition('fid', $new_file->fid)
+    ->execute()
+    ->fetchAssoc();
+
+  if ($db_path['uri'] != $new_file->uri) {
+
+    // This happens when a revision is being reverted.
+    $next_good_uri = file_destination($desired_destination, FILE_EXISTS_RENAME);
+    db_update('file_managed')
+      ->fields(array('uri' => $next_good_uri))
+      ->condition('fid', $new_file->fid)
+      ->execute();
+
+    $new_file->uri = $desired_destination;
+  }
+  else {
+
+    // If the filename has been modified by adding a _X value, or on certain
+    // situations the URI will not match the URI in the DB, such as when
+    // reverting a revision. When reverting a revision change the filename as
+    // well.
+    if (!strpos($new_file->uri, $new_file->filename)) {
+
+      $is_blocked = FALSE;
+      $blocking_file = NULL;
+      $tmp_destination = '';
+
+      // The filename is not in the URI, so Drupal must have added a "_X" before
+      // the extension. Find the file that is blocking this file from keeping
+      // the correct path.
+      $result = db_select('file_managed', 'f')
+        ->fields('f')
+        ->condition('uri', $desired_destination)
+        ->execute();
+      // @todo Only one result is handled, should allow for multiple results.
+      foreach ($result as $file) {
+        $is_blocked = TRUE;
+        $blocking_file = $file;
+        $tmp_destination = file_directory_temp() . "/test_-" . $blocking_file->fid . "_-" . $blocking_file->filename;
+      }
+
+      $old_destination = $db_path['uri'];
+
+      $t_message = 'The file %old could not be moved to %new';
+
+      // Swap the files.
+      if ($is_blocked) {
+        // Move the blocking file to a temporary location.
+        if (!file_unmanaged_move($desired_destination, $tmp_destination)) {
+          drupal_set_message(t($t_message, array('%old' => $desired_destination, '%new' => $tmp_destination)), 'error');
+          return NULL;
+        }
+
+        // Move blocking file was successful, update the DB.
+        db_update('file_managed')
+          ->fields(array('uri' => $tmp_destination))
+          ->condition('fid', $blocking_file->fid)
+          ->execute();
+      }
+
+      // Move the new file to the preferred location.
+      if (!file_unmanaged_move($old_destination, $desired_destination)) {
+        drupal_set_message(t($t_message, array('%old' => $old_destination, '%new' => $desired_destination)), 'error');
+        return NULL;
+      }
+
+      // Move new file was successful, update the DB.
+      db_update('file_managed')
+        ->fields(array('uri' => $desired_destination))
+        ->condition('fid', $new_file->fid)
+        ->execute();
+
+      // Set the new file's path to the correct path.
+      $new_file->uri = $desired_destination;
+
+      if ($is_blocked) {
+
+        // Move the older file from temp to the new _X location
+        if (!file_unmanaged_move($tmp_destination, $old_destination)) {
+          drupal_set_message(t($t_message, array('%old' => $tmp_destination, '%new' => $old_destination)), 'error');
+          return NULL;
+        }
+
+        // Move blocking file was successful, update the DB with the actual
+        // location after file copy, so we use tmp_destination as it was
+        // updated during the move.
+        db_update('file_managed')
+          ->fields(array('uri' => $old_destination))
+          ->condition('fid', $blocking_file->fid)
+          ->execute();
+        // @todo Refactor to use file_save() so we don't need this.
+        entity_get_controller('file')->resetCache(array($blocking_file->fid));
+      }
+    }
+  }
+
+  // Clear the generated image styles for this file.
+  $query = "SELECT DISTINCT uri FROM {file_managed} WHERE fid=:fid";
+  $uri = db_query($query, array(':fid' => $new_file->fid))->fetchField();
+  image_path_flush($uri);
+  if (isset($old_destination)) {
+    image_path_flush($old_destination);
+  }
+
+  // @todo Refactor to use file_save() so we don't need this.
+  entity_get_controller('file')->resetCache(array($new_file->fid));
+}
+
+/**
+ * Implements hook_file_delete().
+ *
+ * Update the URI in the file object before deleting as we may have altered it
+ * above.
+ */
+function cis_helper_file_delete($file) {
+  $file->uri = db_select('file_managed', 'f')
+    ->fields('f', array('uri'))
+    ->condition('f.fid', $file->fid)
+    ->execute()
+    ->fetchField();
+}

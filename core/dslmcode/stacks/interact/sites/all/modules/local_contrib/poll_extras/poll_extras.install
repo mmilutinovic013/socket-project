@@ -1,0 +1,39 @@
+<?php
+/**
+ * @file
+ * Install, update and uninstall functions for the poll_extras module.
+ */
+
+/**
+ * Implements hook_install().
+ */
+function poll_extras_install() {
+  db_query("ALTER TABLE {poll} ADD COLUMN message text AFTER active");
+  db_update('system')
+  ->fields(array(
+    'weight' => 10,
+  ))
+  ->condition('name', 'poll_extras')
+  ->condition('type', 'module')
+  ->execute();
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function poll_extras_uninstall() {
+  db_query("ALTER TABLE {poll} DROP COLUMN message");
+}
+
+/**
+ * Implements hook_schema_alter().
+ */
+function poll_extras_schema_alter(&$schema) {
+  // add support for custom message to display if unable to view a poll
+  $schema['poll']['fields']['message'] = array(
+    'description' => 'The message to display if the user is not allowed to view results',
+    'type' => 'text',
+    'not null' => FALSE,
+    'size' => 'big',
+  );
+}

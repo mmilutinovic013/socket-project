@@ -1,0 +1,58 @@
+.vertical-tabs {
+  display: none;
+}
+
+h1#page-title {
+  font-size: 3em;
+  margin: 0;
+  text-align: left;
+  padding: 0;
+}
+
+#edit-actions{
+  bottom: 0;
+  position: fixed;
+  width: 100%;
+  background-color: #EEEEEE;
+  left: 0;
+  margin: 0;
+  padding: .25rem;
+  z-index: 100;
+}
+#edit-actions button{
+  margin: 0;
+}
+
+body.entity-iframe-theme:not(.modal-rendered) .form-actions.form-wrapper {
+  position:relative;
+}
+
+body.entity-iframe-theme.modal-rendered {
+  margin-top:3.5rem;
+}
+body.entity-iframe-theme.modal-rendered h1#page-title{
+  top:0;
+  left: 0;
+  right: 0;
+  font-size: 1.5rem;
+  line-height: 1.5rem;
+  margin: 0;
+  position: fixed;
+  background-color: #EEEEEE;
+  z-index: 1000;
+  height: 2.5rem;
+  padding: 2rem 0;
+  border-bottom-style: solid;
+  border-bottom-width: .2rem;
+}
+
+html { height: auto !important; }
+body { height: auto !important; }
+
+.off-canvas-wrap .inner-wrap {
+  margin:0 !important;
+}
+
+.l12 {
+  padding: 0;
+}

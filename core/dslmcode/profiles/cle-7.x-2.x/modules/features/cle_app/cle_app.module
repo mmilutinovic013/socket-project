@@ -1,0 +1,99 @@
+<?php
+/**
+ * @file
+ * Code for the CLE App module.
+ */
+
+ include_once 'cle_app.features.inc';
+
+/**
+ * Implements hook_page_build().
+ */
+function cle_app_page_build(&$page) {
+  // ensure this is at least in scope of the app
+  if (arg(0) == 'cle' && arg(1) == 'app') {
+    drupal_add_css(drupal_get_path('module', 'cle_app') . '/app/dist/styles.bundle.css');
+    drupal_add_js(drupal_get_path('module', 'cle_app') . '/app/dist/inline.bundle.js', array('scope' => 'footer'));
+    drupal_add_js(drupal_get_path('module', 'cle_app') . '/app/dist/scripts.bundle.js', array('scope' => 'footer'));
+    drupal_add_js(drupal_get_path('module', 'cle_app') . '/app/dist/vendor.bundle.js', array('scope' => 'footer'));
+    drupal_add_js(drupal_get_path('module', 'cle_app') . '/app/dist/main.bundle.js', array('scope' => 'footer'));
+  }
+}
+
+/*
+ * Preprocesses the wrapping HTML.
+ *
+ * @param array &$variables
+ *   Template variables.
+ */
+function cle_app_preprocess_html(&$vars) {
+  global $base_url;
+  $current_path = current_path();
+  // if we are on the cle critique app route then we need to add a base tag to
+  // ensure that angular works properly.
+  if (preg_match('/^cle\/app/', $current_path)) {
+    // Setup IE meta tag to force IE rendering mode
+    $base_tag = array(
+      '#type' => 'html_tag',
+      '#tag' => 'base',
+      '#attributes' => array(
+        'href' =>  $base_url . '/cle/app',
+      )
+    );
+
+    // Add header meta tag for IE to head
+    drupal_add_html_head($base_tag, 'base_tag');
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function cle_app_menu() {
+  $items['cle'] = array(
+    'title' => 'Assignments',
+    'page callback' => '_cle_app_redirect',
+    'page arguments' => array(),
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+    'weight' => -10,
+  );
+  $items['cle/app'] = array(
+    'title' => 'Assignments',
+    'page callback' => '_cle_app_redirect',
+    'page arguments' => array(),
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+    'weight' => -10,
+  );
+  $items['cle/app/projects'] = array(
+    'title' => 'Assignments',
+    'page callback' => '_cle_app_page_critique_app',
+    'access arguments' => array('access content'),
+    'type' => MENU_NORMAL_ITEM,
+    'menu_name' => 'menu-elmsln-navigation',
+    'weight' => -10,
+  );
+  $items['cle/app/%'] = array(
+    'title' => 'Assignments',
+    'page callback' => '_cle_app_page_critique_app',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+    'weight' => -10,
+  );
+  return $items;
+}
+
+/**
+ * Simple callback to avoid argument issues w/ drupal_goto in menu router
+ */
+function _cle_app_redirect() {
+  drupal_goto('cle/app/projects');
+}
+
+/**
+ * Page callback for cle/app
+ */
+function _cle_app_page_critique_app() {
+  return '<app-root> <div class="progress"> <div class="indeterminate"></div> </div></app-root>';
+}
