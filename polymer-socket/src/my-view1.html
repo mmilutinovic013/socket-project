@@ -81,8 +81,6 @@ subject to an additional IP rights grant found at http://polymer.github.io/PATEN
           // Textboxt -> Socket -> Window Flow
           //Simply pushes it to screen...not quite what we want. Comment out for testing.
           //chatWindow.push('messages', message);
-        });
-        chatWindow.addEventListener('chat message', function(e) {
           chatWindow.inputText = '';
           chatWindow.events = []; 
           console.log(chatWindow.events);
@@ -92,7 +90,7 @@ subject to an additional IP rights grant found at http://polymer.github.io/PATEN
             console.log("Response event fired");
             socket.node.$.socket.emit('chat message', message);
           }
-          chatWindow.events.push('chat message', message);
+          chatWindow.push('events', message);
         });
       },
     });
