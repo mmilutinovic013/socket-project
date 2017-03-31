@@ -1,0 +1,101 @@
+<!--
+@license
+Copyright (c) 2016 The Polymer Project Authors. All rights reserved.
+This code may only be used under the BSD style license found at http://polymer.github.io/LICENSE.txt
+The complete set of authors may be found at http://polymer.github.io/AUTHORS.txt
+The complete set of contributors may be found at http://polymer.github.io/CONTRIBUTORS.txt
+Code distributed by Google as part of the polymer project is also
+subject to an additional IP rights grant found at http://polymer.github.io/PATENTS.txt
+-->
+
+<link rel="import" href="../bower_components/polymer/polymer.html">
+<link rel="import" href="shared-styles.html">
+<link rel="import" href="../bower_components/socket-io/socket-io.html">
+<link rel="import" href="../bower_components/chat-window/chat-input.html">
+<link rel="import" href="../bower_components/chat-window/chat-messages.html">
+<link rel="import" href="../bower_components/chat-window/chat-window.html">
+<link rel="import" href="../bower_components/from-now/from-now.html">
+
+
+
+<dom-module id="my-view1">
+  <template id ="test">
+    <style include="shared-styles">
+      :host {
+        display: block;
+        padding: 10px;
+      }
+    </style>
+    <div class="card">
+      <div class="circle">1</div>
+      <h1>View One</h1>
+      <p>Ut labores minimum atomorum pro. Laudem tibique ut has.</p>
+      <p>Lorem ipsum dolor sit amet, per in nusquam nominavi periculis, sit elit oportere ea.Lorem ipsum dolor sit amet, per in nusquam nominavi periculis, sit elit oportere ea.Cu mei vide viris gloriatur, at populo eripuit sit.</p>
+      <template is="dom-bind" id="widget">
+        <p>Is Connected: {{isConnected}}</p>
+        <socket-io id="socket" endpoint="http://localhost:8088/" events="['events']" is-connected="{{isConnected}}" on-connected="_connected"></socket-io>
+      </template>
+
+        <button>Send Message</button>
+        <chat-window
+          id="chat"
+          author="mmilutinovic1313"
+          single-line
+          messages="{{messages}}">
+          {{messages}}
+        </chat-window>
+  </div>
+  </template>
+  <script>
+    Polymer({
+      is: 'my-view1',
+      properties: {
+        messages: {
+          type: Array,
+          value: [
+            {
+              "author": "mmilutinovic1313",
+              "text": "Hello",
+              "created": Date.now(),
+            },
+            {
+              "author": "hamcat",
+              "text": "How are you",
+              "created": Date.now(),
+            },
+          ]
+        }
+      },
+      listeners: {
+        
+      },
+      ready: function() {
+        var chatWindow = this.$$('chat-window');
+        chatWindow.addEventListener('send', function(e) {
+          console.log(e);
+          var message = {
+          text: e.detail,
+          created: e.timestamp,
+          author: "mmilutinovic1313"
+          };
+          // Textboxt -> Socket -> Window Flow
+          //Simply pushes it to screen...not quite what we want. Comment out for testing.
+          //chatWindow.push('messages', message);
+        });
+        chatWindow.addEventListener('chat message', function(e) {
+          chatWindow.inputText = '';
+          chatWindow.events = []; 
+          console.log(chatWindow.events);
+          var socket = Polymer.dom(chatWindow);
+          console.log(socket);
+          chatWindow._respond = function(message) {
+            console.log("Response event fired");
+            socket.node.$.socket.emit('chat message', message);
+          }
+          chatWindow.events.push('chat message', message);
+        });
+      },
+    });
+  </script>
+</dom-module>
+
