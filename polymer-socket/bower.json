@@ -17,7 +17,8 @@
     "polymer": "Polymer/polymer#^1.6.0",
     "socket-io": "daniel-cotton/socket-io#^1.1.1",
     "chat-window": "^0.4.9",
-    "from-now": "from-to-now#^0.3.1"
+    "from-now": "from-to-now#^0.3.1",
+    "socket.io": "^1.7.3"
   },
   "devDependencies": {
     "web-component-tester": "^4.0.0"

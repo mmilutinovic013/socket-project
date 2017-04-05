@@ -8,9 +8,10 @@ Code distributed by Google as part of the polymer project is also
 subject to an additional IP rights grant found at http://polymer.github.io/PATENTS.txt
 -->
 
+<script src="https://cdn.socket.io/socket.io-1.2.0.js"></script>
+<script src="https://code.jquery.com/jquery-1.11.1.js"></script>
 <link rel="import" href="../bower_components/polymer/polymer.html">
 <link rel="import" href="shared-styles.html">
-<link rel="import" href="../bower_components/socket-io/socket-io.html">
 <link rel="import" href="../bower_components/chat-window/chat-input.html">
 <link rel="import" href="../bower_components/chat-window/chat-messages.html">
 <link rel="import" href="../bower_components/chat-window/chat-window.html">
@@ -32,8 +33,6 @@ subject to an additional IP rights grant found at http://polymer.github.io/PATEN
       <p>Ut labores minimum atomorum pro. Laudem tibique ut has.</p>
       <p>Lorem ipsum dolor sit amet, per in nusquam nominavi periculis, sit elit oportere ea.Lorem ipsum dolor sit amet, per in nusquam nominavi periculis, sit elit oportere ea.Cu mei vide viris gloriatur, at populo eripuit sit.</p>
       <template is="dom-bind" id="widget">
-        <p>Is Connected: {{isConnected}}</p>
-        <socket-io id="socket" endpoint="http://localhost:8088/" events="['events']" is-connected="{{isConnected}}" on-connected="_connected"></socket-io>
       </template>
 
         <button>Send Message</button>
@@ -59,38 +58,32 @@ subject to an additional IP rights grant found at http://polymer.github.io/PATEN
               "created": Date.now(),
             },
             {
-              "author": "hamcat",
+              "author": "chatbot",
               "text": "How are you",
               "created": Date.now(),
             },
           ]
         }
       },
-      listeners: {
-        
-      },
       ready: function() {
         var chatWindow = this.$$('chat-window');
+        const socket = io.connect('http://localhost:3000');
+        socket.on('chat message', function(data) {
+          console.log('Hey, I just got this from the server Mark: ', data);
+          chatWindow.push('messages', data);
+        });
         chatWindow.addEventListener('send', function(e) {
           console.log(e);
           var message = {
-          text: e.detail,
-          created: e.timestamp,
-          author: "mmilutinovic1313"
+            text: e.detail,
+            created: e.timestamp,
+            author: "mmilutinovic1313"
           };
           // Textboxt -> Socket -> Window Flow
           //Simply pushes it to screen...not quite what we want. Comment out for testing.
           //chatWindow.push('messages', message);
           chatWindow.inputText = '';
-          chatWindow.events = []; 
-          console.log(chatWindow.events);
-          var socket = Polymer.dom(chatWindow);
-          console.log(socket);
-          chatWindow._respond = function(message) {
-            console.log("Response event fired");
-            socket.node.$.socket.emit('chat message', message);
-          }
-          chatWindow.push('events', message);
+          socket.emit('chat message', message);
         });
       },
     });
