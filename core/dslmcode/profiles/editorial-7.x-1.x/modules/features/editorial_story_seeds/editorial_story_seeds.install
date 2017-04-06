@@ -1,8 +1,0 @@
-<?php
-/**
- * @file
- * editorial_story_seeds.install
- */
-function editorial_story_seeds_update_7000(&$sandbox) {
-  features_revert(array('editorial_story_seeds' => array('views')));
-}

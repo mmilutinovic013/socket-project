@@ -1,5 +1,0 @@
-Host wildwest.github.com
-  HostName github.com
-  User git
-  IdentityFile ~/.ssh/githubwildwest
-  StrictHostKeyChecking no

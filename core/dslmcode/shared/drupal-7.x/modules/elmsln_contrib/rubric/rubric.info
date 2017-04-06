@@ -1,7 +1,0 @@
-core = "7.x"
-description = "Provides custom logic for handling the rubric content type stored in the packaged feature."
-name = "Rubric"
-package = "Rubric"
-project = "rubric"
-dependencies[] = field_collection
-dependencies[] = contextual

@@ -1,8 +1,0 @@
-<?php
-/**
- * @file
- * discuss_displays.install
- */
-function discuss_displays_update_7000(&$sandbox) {
-  features_revert(array('discuss_displays' => array('views')));
-}

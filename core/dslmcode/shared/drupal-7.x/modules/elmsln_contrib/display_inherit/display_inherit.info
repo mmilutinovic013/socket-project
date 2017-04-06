@@ -1,3 +1,0 @@
-name = Display Inherit
-description = Enables the ability to set field display and template inheritance based on viewmode names.
-core = 7.x

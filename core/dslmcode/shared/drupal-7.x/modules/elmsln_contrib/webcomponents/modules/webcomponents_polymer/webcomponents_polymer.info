@@ -1,5 +1,0 @@
-name = Webcomponents: Polymer support
-description = Provides support for polymer to webcomponents.
-core = 7.x
-dependencies[] = simplehtmldom
-dependencies[] = webcomponents

@@ -1,7 +1,0 @@
-<?php
-/**
- * @file
- * Code for the ICOR Jmol feature.
- */
-
-include_once 'icor_jmol.features.inc';

@@ -1,3 +1,0 @@
-## drush-command-job ##
-
-This drush job is intended for executing complex tasks via Drush that the front-end can't assume to be able to do on its own. ELMS Compliance Distribution utilizes this in order to tell networks (or the entire system) to grant someone access to sites (for example). It is intended for picking up files that match a certain name and then building a well structured drush call against the target in question.

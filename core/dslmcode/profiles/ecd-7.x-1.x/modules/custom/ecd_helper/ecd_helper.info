@@ -1,4 +1,0 @@
-name = "ECD helper"
-description = "ELMS compliance distro glue code"
-core = 7.x
-files[] = ecd_helper.module

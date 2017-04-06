@@ -1,1 +1,0 @@
-../../../../../config/stacks/courses/sites/sites.php

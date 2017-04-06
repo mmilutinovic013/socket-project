@@ -1,4 +1,0 @@
-name = Webcomponents: WYSIWYG Templates
-description = Provides wysiwyg template support to webcomponents.
-core = 7.x
-dependencies[] = webcomponents

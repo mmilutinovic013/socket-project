@@ -1,5 +1,0 @@
-name = Book Copy
-description = Allows users to replicate book outlines in part of whole.
-dependencies[] = book
-dependencies[] = replicate
-core = 7.x
