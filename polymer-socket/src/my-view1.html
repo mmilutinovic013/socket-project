@@ -73,9 +73,10 @@ subject to an additional IP rights grant found at http://polymer.github.io/PATEN
           console.log('Hey, I just got this from the server Mark: ', data);
           chatWindow.push('messages', data);
         });
-        socket.on('connectingUser', function(data){
+        socket.on('add user', function(data){
           console.log("User ", data);
         });
+        
         chatWindow.addEventListener('send', function(e) {
           console.log(e);
           var message = {
