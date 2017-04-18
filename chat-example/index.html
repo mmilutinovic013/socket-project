@@ -15,6 +15,14 @@
     </style>
   </head>
   <body>
+  <ul class="pages">
+    <li class="login page">
+      <div class="form">
+        <h3 class="title">What's your nickname?</h3>
+        <input class="usernameInput" type="text" maxlength="14" />
+      </div>
+    </li>
+  </ul>
     <ul id="messages"></ul>
     <form action="">
       <input id="m" autocomplete="off" /><button>Send</button>
@@ -24,10 +32,17 @@
     <script src="https://code.jquery.com/jquery-1.11.1.js"></script>
     <script>
       $(function () {
+        var FADE_TIME = 150; // ms
+        var TYPING_TIMER_LENGTH = 400; // ms
+        var COLORS = [
+          '#e21400', '#91580f', '#f8a700', '#f78b00',
+          '#58dc00', '#287b00', '#a8f07a', '#4ae8c4',
+          '#3b88eb', '#3824aa', '#a700ff', '#d300e7'
+        ];
         var $loginPage = $('.login.page'); // The login page
         var $chatPage = $('.chat.page'); // The chatroom page
         var $window = $(window);
-        var $usernameInput = $('#m'); // Input for username
+        var $usernameInput = $('.usernameInput'); // Input for username
         var $currentInput = $usernameInput.focus();
         var $inputMessage = $('#m'); // Input message input box
         var username;
@@ -43,6 +58,36 @@
           $('#m').val('');
           return false;
         });
+        // Log a message
+        function log (message, options) {
+          var $el = $('<li>').addClass('log').text(message);
+          addMessageElement($el, options);
+        }
+        // Add message element 
+        function addMessageElement (el, options) {
+          var $el = $(el);
+          // Setup default options
+          if (!options) {
+            options = {};
+          }
+          if (typeof options.fade === 'undefined') {
+            options.fade = true;
+          }
+          if (typeof options.prepend === 'undefined') {
+            options.prepend = false;
+          }
+
+          // Apply options
+          if (options.fade) {
+            $el.hide().fadeIn(FADE_TIME);
+          }
+          if (options.prepend) {
+            $('#messages').prepend($el);
+          } else {
+            $('#messages').append($el);
+          }
+          $('#messages')[0].scrollTop = $('#messages')[0].scrollHeight;
+        }
          // Sets the client's username
         function setUsername () {
           username = cleanInput($usernameInput.val().trim());
@@ -77,8 +122,22 @@
         function cleanInput (input) {
           return $('<div/>').text(input).text();
         }
+        // Gets the color of a username through our hash function
+        function getUsernameColor (username) {
+          // Compute hash code
+          var hash = 7;
+          for (var i = 0; i < username.length; i++) {
+            hash = username.charCodeAt(i) + (hash << 5) - hash;
+          }
+          // Calculate color
+          var index = Math.abs(hash % COLORS.length);
+          return COLORS[index];
+        }
         socket.on('chat message', function(msg){
-          $('#messages').append($('<li>').text(msg.text));
+          var $usernameDiv = $('<span class="username"/>')
+            .text(msg.author)
+            .css('color', getUsernameColor(msg.author));
+          $('#messages').append($usernameDiv, $('<li>').text(msg.text));
           window.scrollTo(0, document.body.scrollHeight);
         });
         // Focus input when clicking anywhere on login page
@@ -92,7 +151,7 @@
           } else {
             message += "there are " + data.numUsers + " participants";
           }
-          console.log(message);
+          log(message);
         }
         // Whenever the server emits 'login', log the login message
       socket.on('login', function (data) {
@@ -103,13 +162,13 @@
       });
       // Whenever the server emits 'user joined', log it in the chat body
       socket.on('user joined', function (data) {
-        console.log(data.username + ' joined');
+        log(data.username + ' joined');
         addParticipantsMessage(data);
       });
 
       // Whenever the server emits 'user left', log it in the chat body
       socket.on('user left', function (data) {
-        console.log(data.username + ' left');
+        log(data.username + ' left');
         addParticipantsMessage(data);
         removeChatTyping(data);
       });
