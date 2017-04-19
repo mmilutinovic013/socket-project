@@ -19,7 +19,7 @@ subject to an additional IP rights grant found at http://polymer.github.io/PATEN
 
 
 
-<dom-module id="my-view1">
+<dom-module id="socket-chat-app">
   <template id ="test">
     <style include="shared-styles">
       :host {
@@ -47,8 +47,12 @@ subject to an additional IP rights grant found at http://polymer.github.io/PATEN
   </template>
   <script>
     Polymer({
-      is: 'my-view1',
+      is: 'socket-chat-app',
       properties: {
+        url: {
+          type: String,
+          value: 'https://pacific-dusk-69691.herokuapp.com/',
+        },
         messages: {
           type: Array,
           value: [
@@ -68,7 +72,7 @@ subject to an additional IP rights grant found at http://polymer.github.io/PATEN
       ready: function() {
         var chatWindow = this.$$('chat-window');
         //Heroku app connection. 
-        const socket = io.connect('http://localhost:3000');
+        const socket = io.connect(this.url);
         socket.on('chat message', function(data) {
           console.log('Hey, I just got this from the server Mark: ', data);
           chatWindow.push('messages', data);
